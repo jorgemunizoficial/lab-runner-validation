@@ -1,0 +1,88 @@
+
+name: Validate Synthetic Watchdog
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate automatic stop and cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAME="watchdog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SUPERVISOR_PID=""
+
+          cleanup() {
+            if [ -n "$SUPERVISOR_PID" ]; then
+              kill "$SUPERVISOR_PID" 2>/dev/null || true
+              wait "$SUPERVISOR_PID" 2>/dev/null || true
+            fi
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          echo "=== Public synthetic image ==="
+          docker pull alpine:3.20
+
+          echo "=== Start synthetic worker ==="
+          docker run -d \
+            --name "$NAME" \
+            --network none \
+            --cpus 1 \
+            --memory 512m \
+            --pids-limit 64 \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --user 65534:65534 \
+            alpine:3.20 \
+            sh -c 'while :; do sleep 1; done'
+
+          echo "=== Start external watchdog ==="
+
+          START=$(date +%s%3N)
+
+          (
+            sleep 2
+            docker kill "$NAME" >/dev/null
+          ) &
+          SUPERVISOR_PID=$!
+
+          echo "=== Wait for automatic stop ==="
+
+          timeout 5s docker wait "$NAME" >/dev/null
+          wait "$SUPERVISOR_PID"
+          SUPERVISOR_PID=""
+
+          END=$(date +%s%3N)
+          ELAPSED=$((END - START))
+
+          test "$(docker inspect -f \
+            '{{.State.Running}}' "$NAME")" = "false"
+
+          echo "Watchdog stop: ${ELAPSED} ms"
+          test "$ELAPSED" -le 5000
+
+          echo "PASS: automatic worker stop"
+
+          echo "=== Validate cleanup ==="
+
+          docker rm -f "$NAME" >/dev/null
+
+          if docker inspect "$NAME" >/dev/null 2>&1; then
+            echo "FAIL: worker still exists"
+            exit 1
+          fi
+
+          echo "PASS: own worker removed"
+          echo "PASS: synthetic watchdog smoke test"
