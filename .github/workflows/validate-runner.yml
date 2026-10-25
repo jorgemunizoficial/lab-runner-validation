@@ -1,0 +1,32 @@
+name: Validate Ubuntu Runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check VM resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== CPU ==="
+          nproc
+          echo "=== Memory ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
+          echo "=== Architecture ==="
+          uname -m
+
+          test "$(nproc)" -ge 4
+          test "$(awk '/MemTotal:/ {print $2}' /proc/meminfo)" -ge 8388608
+          test "$(df -Pk / | awk 'NR==2 {print $4}')" -ge 4194304
+
+          echo "PASS — minimum resources available"
