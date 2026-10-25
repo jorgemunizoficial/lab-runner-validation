@@ -1,0 +1,123 @@
+
+name: Validate Synthetic Safety Controls
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  safety-controls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate worker safety controls
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAME="safety-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "=== Prepare public synthetic image ==="
+          docker pull alpine:3.20
+
+          echo "=== Start restricted worker ==="
+          docker run -d \
+            --name "$NAME" \
+            --network none \
+            --cpus 1 \
+            --memory 512m \
+            --memory-swap 512m \
+            --pids-limit 64 \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,noexec,size=256m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --user 65534:65534 \
+            alpine:3.20 \
+            sh -c 'while :; do sleep 1; done'
+
+          echo "=== Verify actual Docker configuration ==="
+
+          test "$(docker inspect -f \
+            '{{.HostConfig.NetworkMode}}' "$NAME")" = "none"
+
+          test "$(docker inspect -f \
+            '{{.HostConfig.NanoCpus}}' "$NAME")" -eq 1000000000
+
+          test "$(docker inspect -f \
+            '{{.HostConfig.Memory}}' "$NAME")" -eq 536870912
+
+          test "$(docker inspect -f \
+            '{{.HostConfig.PidsLimit}}' "$NAME")" -eq 64
+
+          test "$(docker inspect -f \
+            '{{.HostConfig.ReadonlyRootfs}}' "$NAME")" = "true"
+
+          echo "PASS: resource configuration"
+
+          echo "=== Verify worker network ==="
+
+          docker exec "$NAME" sh -c '
+            set -e
+            test ! -e /sys/class/net/eth0
+            if ip route | grep -q "^default"; then
+              echo "FAIL: default IPv4 route"
+              exit 1
+            fi
+            if ip -6 route | grep -q "^default"; then
+              echo "FAIL: default IPv6 route"
+              exit 1
+            fi
+            echo "PASS: no external network route"
+          '
+
+          echo "=== Verify filesystem restrictions ==="
+
+          docker exec "$NAME" sh -c '
+            set -e
+            if touch /synthetic-test-file 2>/dev/null; then
+              echo "FAIL: root filesystem writable"
+              exit 1
+            fi
+            echo "synthetic" > /tmp/synthetic.txt
+            test "$(cat /tmp/synthetic.txt)" = "synthetic"
+            echo "PASS: read-only root and private tmp"
+          '
+
+          echo "=== Test external forced stop ==="
+
+          START=$(date +%s%3N)
+
+          timeout 5s docker kill "$NAME" >/dev/null
+
+          END=$(date +%s%3N)
+          ELAPSED=$((END - START))
+
+          test "$(docker inspect -f \
+            '{{.State.Running}}' "$NAME")" = "false"
+
+          echo "Stop duration: ${ELAPSED} ms"
+          test "$ELAPSED" -le 5000
+
+          echo "PASS: externally forced stop"
+
+          echo "=== Remove own worker ==="
+
+          cleanup
+          trap - EXIT
+
+          if docker inspect "$NAME" >/dev/null 2>&1; then
+            echo "FAIL: worker not removed"
+            exit 1
+          fi
+
+          echo "PASS: own worker removed"
+          echo "PASS: synthetic safety smoke test"
