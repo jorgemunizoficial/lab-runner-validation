@@ -1,0 +1,75 @@
+
+name: Validate Synthetic Isolation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate isolated synthetic worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NAME="synthetic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "$NAME" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          echo "=== Public test image ==="
+          docker pull alpine:3.20
+
+          echo "=== Create isolated worker ==="
+          docker run -d \
+            --name "$NAME" \
+            --network none \
+            --cpus 1 \
+            --memory 512m \
+            --pids-limit 64 \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,noexec,size=256m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            alpine:3.20 sleep 60
+
+          echo "=== Verify isolation configuration ==="
+          NETWORK=$(docker inspect -f \
+            '{{.HostConfig.NetworkMode}}' "$NAME")
+          MEMORY=$(docker inspect -f \
+            '{{.HostConfig.Memory}}' "$NAME")
+          PIDS=$(docker inspect -f \
+            '{{.HostConfig.PidsLimit}}' "$NAME")
+
+          test "$NETWORK" = "none"
+          test "$MEMORY" -eq 536870912
+          test "$PIDS" -eq 64
+
+          echo "=== Run synthetic worker ==="
+          docker exec "$NAME" sh -c '
+            set -e
+            test ! -e /sys/class/net/eth0
+            echo synthetic-only > /tmp/test.txt
+            test "$(cat /tmp/test.txt)" = "synthetic-only"
+            echo "PASS: isolated synthetic worker"
+          '
+
+          echo "=== Cleanup own scenario ==="
+          cleanup
+          trap - EXIT
+
+          if docker inspect "$NAME" >/dev/null 2>&1; then
+            echo "FAIL: container still exists"
+            exit 1
+          fi
+
+          echo "PASS: own container removed"
+          echo "PASS: synthetic isolation smoke test"
