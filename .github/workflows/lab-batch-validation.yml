@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Run synthetic validation batch
+      - name: Run consolidated controls T5-T8
         shell: bash
         run: |
           set -euo pipefail
@@ -21,16 +21,29 @@ jobs:
           PREFIX="batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           A="${PREFIX}-a"
           B="${PREFIX}-b"
+          EVIDENCE=$(mktemp -d)
+          WATCHDOG_PID=""
 
           cleanup() {
-            docker rm -f "$A" "$B" >/dev/null 2>&1 || true
+            if [ -n "$WATCHDOG_PID" ]; then
+              kill "$WATCHDOG_PID" 2>/dev/null || true
+              wait "$WATCHDOG_PID" 2>/dev/null || true
+            fi
+
+            docker rm -f "$A" "$B" \
+              >/dev/null 2>&1 || true
+
+            rm -rf -- "$EVIDENCE"
           }
+
           trap cleanup EXIT
 
           echo "=== Prepare public image ==="
-          docker pull alpine:3.20
+          IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+          docker pull "$IMAGE"
 
-          echo "=== Create two independent workers ==="
+          echo "=== Create independent synthetic workers ==="
+
           for NAME in "$A" "$B"; do
             docker run -d \
               --name "$NAME" \
@@ -44,87 +57,129 @@ jobs:
               --cap-drop ALL \
               --security-opt no-new-privileges \
               --user 65534:65534 \
-              alpine:3.20 \
-              sh -c 'while :; do sleep 1; done'
+              "$IMAGE" \
+              sh -c 'while :; do sleep 1; done' \
+              >/dev/null
           done
 
-          echo "=== T1: storage separation ==="
+          echo "=== T5: Synthetic authorization revocation ==="
+
           docker exec "$A" sh -c \
-            'echo CASE_A > /tmp/case.txt'
+            'echo ALLOW_A > /tmp/grant'
 
           docker exec "$B" sh -c \
-            'test ! -e /tmp/case.txt'
+            'echo ALLOW_B > /tmp/grant'
+
+          docker exec "$A" sh -c \
+            'test "$(cat /tmp/grant)" = "ALLOW_A"'
 
           docker exec "$B" sh -c \
-            'echo CASE_B > /tmp/case.txt'
+            'test "$(cat /tmp/grant)" = "ALLOW_B"'
 
-          test "$(docker exec "$A" \
-            cat /tmp/case.txt)" = "CASE_A"
+          docker exec "$A" rm /tmp/grant
 
-          test "$(docker exec "$B" \
-            cat /tmp/case.txt)" = "CASE_B"
+          docker exec "$A" sh -c '
+            if test -f /tmp/grant; then
+              exit 1
+            fi
+          '
 
-          echo "PASS T1: independent temporary storage"
+          docker exec "$B" sh -c \
+            'test "$(cat /tmp/grant)" = "ALLOW_B"'
 
-          echo "=== T2: resource limits ==="
-          for NAME in "$A" "$B"; do
-            test "$(docker inspect -f \
-              '{{.HostConfig.Memory}}' "$NAME")" \
-              -eq 536870912
+          echo "PASS T5: revoked grant denies new check"
 
-            test "$(docker inspect -f \
-              '{{.HostConfig.PidsLimit}}' "$NAME")" \
-              -eq 64
+          echo "=== T6: Fail-closed synthetic guardian ==="
 
-            test "$(docker inspect -f \
-              '{{.HostConfig.NetworkMode}}' "$NAME")" \
-              = "none"
+          LEASE="$EVIDENCE/guardian-lease"
+          echo ACTIVE > "$LEASE"
 
-            docker exec "$NAME" sh -c '
-              if [ -f /sys/fs/cgroup/memory.max ]; then
-                test "$(cat /sys/fs/cgroup/memory.max)" \
-                  = "536870912"
-                echo "PASS: memory cgroup limit"
-              else
-                echo "NOT_PROVEN: cgroup memory limit"
-              fi
-            '
-          done
+          (
+            while test -f "$LEASE"; do
+              sleep 0.1
+            done
 
-          echo "PASS T2: declared resource limits"
+            docker kill "$A" >/dev/null
+          ) &
+          WATCHDOG_PID=$!
 
-          echo "=== T3: external stop ==="
           START=$(date +%s%3N)
+          rm "$LEASE"
 
-          timeout 5s docker kill "$A" "$B" \
-            >/dev/null
+          timeout 5s docker wait "$A" >/dev/null
+          wait "$WATCHDOG_PID"
+          WATCHDOG_PID=""
 
           END=$(date +%s%3N)
           ELAPSED=$((END - START))
 
           test "$ELAPSED" -le 5000
 
-          for NAME in "$A" "$B"; do
-            test "$(docker inspect -f \
-              '{{.State.Running}}' "$NAME")" \
-              = "false"
-          done
+          test "$(docker inspect -f \
+            '{{.State.Running}}' "$A")" = "false"
 
-          echo "Stop duration: ${ELAPSED} ms"
-          echo "PASS T3: both workers stopped"
+          test "$(docker inspect -f \
+            '{{.State.Running}}' "$B")" = "true"
 
-          echo "=== T4: cleanup ==="
-          cleanup
+          echo "Guardian response: ${ELAPSED} ms"
+          echo "PASS T6: simulated lease loss stops A"
 
-          for NAME in "$A" "$B"; do
-            if docker inspect "$NAME" \
-              >/dev/null 2>&1; then
-              echo "FAIL: residual worker"
-              exit 1
-            fi
-          done
+          echo "=== T7: Synthetic evidence integrity ==="
 
+          printf '%s\n' \
+            'fixture=artificial' \
+            'case=A' \
+            'classification=PUBLIC_SYNTHETIC' \
+            > "$EVIDENCE/evidence.txt"
+
+          (
+            cd "$EVIDENCE"
+            sha256sum evidence.txt > manifest.sha256
+            sha256sum -c manifest.sha256 >/dev/null
+          )
+
+          echo 'synthetic-tampering' \
+            >> "$EVIDENCE/evidence.txt"
+
+          if (
+            cd "$EVIDENCE"
+            sha256sum -c manifest.sha256 \
+              >/dev/null 2>&1
+          ); then
+            echo "FAIL: alteration not detected"
+            exit 1
+          fi
+
+          echo "PASS T7: tampering detected"
+
+          echo "=== T8: Ownership and scoped cleanup ==="
+
+          docker exec "$B" sh -c \
+            'echo B_INTACT > /tmp/ownership'
+
+          docker rm -f "$A" >/dev/null
+
+          if docker inspect "$A" >/dev/null 2>&1; then
+            echo "FAIL: A still exists"
+            exit 1
+          fi
+
+          test "$(docker inspect -f \
+            '{{.State.Running}}' "$B")" = "true"
+
+          docker exec "$B" sh -c \
+            'test "$(cat /tmp/ownership)" = "B_INTACT"'
+
+          echo "PASS T8: B unaffected by cleanup of A"
+
+          docker rm -f "$B" >/dev/null
+
+          if docker inspect "$B" >/dev/null 2>&1; then
+            echo "FAIL: B still exists"
+            exit 1
+          fi
+
+          rm -rf -- "$EVIDENCE"
           trap - EXIT
 
-          echo "PASS T4: own workers removed"
-          echo "PASS: consolidated synthetic batch"
+          echo "PASS: consolidated controls T5-T8"
