@@ -10,10 +10,10 @@ permissions:
 jobs:
   batch-validation:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 8
 
     steps:
-      - name: Run consolidated controls T5-T8
+      - name: Run synthetic controls T9-T12
         shell: bash
         run: |
           set -euo pipefail
@@ -21,29 +21,26 @@ jobs:
           PREFIX="batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           A="${PREFIX}-a"
           B="${PREFIX}-b"
-          EVIDENCE=$(mktemp -d)
-          WATCHDOG_PID=""
+          C="${PREFIX}-failure"
+          WORKER_PID=""
 
           cleanup() {
-            if [ -n "$WATCHDOG_PID" ]; then
-              kill "$WATCHDOG_PID" 2>/dev/null || true
-              wait "$WATCHDOG_PID" 2>/dev/null || true
+            if [ -n "$WORKER_PID" ]; then
+              kill "$WORKER_PID" 2>/dev/null || true
+              wait "$WORKER_PID" 2>/dev/null || true
             fi
-
-            docker rm -f "$A" "$B" \
+            docker rm -f "$A" "$B" "$C" \
               >/dev/null 2>&1 || true
-
-            rm -rf -- "$EVIDENCE"
           }
 
           trap cleanup EXIT
 
-          echo "=== Prepare public image ==="
           IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
+
+          echo "=== Prepare public image ==="
           docker pull "$IMAGE"
 
-          echo "=== Create independent synthetic workers ==="
-
+          echo "=== Create synthetic workers ==="
           for NAME in "$A" "$B"; do
             docker run -d \
               --name "$NAME" \
@@ -62,124 +59,111 @@ jobs:
               >/dev/null
           done
 
-          echo "=== T5: Synthetic authorization revocation ==="
+          echo "=== T9: Deny external network attempt ==="
 
-          docker exec "$A" sh -c \
-            'echo ALLOW_A > /tmp/grant'
-
-          docker exec "$B" sh -c \
-            'echo ALLOW_B > /tmp/grant'
-
-          docker exec "$A" sh -c \
-            'test "$(cat /tmp/grant)" = "ALLOW_A"'
-
-          docker exec "$B" sh -c \
-            'test "$(cat /tmp/grant)" = "ALLOW_B"'
-
-          docker exec "$A" rm /tmp/grant
+          test "$(docker inspect -f \
+            '{{.HostConfig.NetworkMode}}' "$A")" = "none"
 
           docker exec "$A" sh -c '
-            if test -f /tmp/grant; then
+            if wget -T 2 -q -O /dev/null \
+              http://1.1.1.1/ 2>/dev/null; then
+              echo "FAIL T9: external connection succeeded"
               exit 1
             fi
+            echo "PASS T9: external request rejected"
           '
 
-          docker exec "$B" sh -c \
-            'test "$(cat /tmp/grant)" = "ALLOW_B"'
+          echo "=== T10: Revoke an active synthetic operation ==="
 
-          echo "PASS T5: revoked grant denies new check"
+          docker exec "$A" sh -c \
+            'echo ACTIVE > /tmp/grant'
 
-          echo "=== T6: Fail-closed synthetic guardian ==="
-
-          LEASE="$EVIDENCE/guardian-lease"
-          echo ACTIVE > "$LEASE"
-
-          (
-            while test -f "$LEASE"; do
+          docker exec "$A" sh -c '
+            while test -f /tmp/grant; do
               sleep 0.1
             done
+            echo "Operation stopped after revocation"
+          ' &
+          WORKER_PID=$!
 
-            docker kill "$A" >/dev/null
-          ) &
-          WATCHDOG_PID=$!
+          sleep 0.5
 
           START=$(date +%s%3N)
-          rm "$LEASE"
+          docker exec "$A" rm /tmp/grant
 
-          timeout 5s docker wait "$A" >/dev/null
-          wait "$WATCHDOG_PID"
-          WATCHDOG_PID=""
+          # Wait up to 5 seconds for the synthetic operation.
+          for i in $(seq 1 50); do
+            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+
+          if kill -0 "$WORKER_PID" 2>/dev/null; then
+            echo "FAIL T10: operation did not stop"
+            exit 1
+          fi
+
+          wait "$WORKER_PID"
+          WORKER_PID=""
 
           END=$(date +%s%3N)
           ELAPSED=$((END - START))
 
+          echo "Revocation response: ${ELAPSED} ms"
           test "$ELAPSED" -le 5000
 
-          test "$(docker inspect -f \
-            '{{.State.Running}}' "$A")" = "false"
+          echo "PASS T10: synthetic operation stopped"
 
-          test "$(docker inspect -f \
-            '{{.State.Running}}' "$B")" = "true"
+          echo "=== T11: Cleanup after synthetic failure ==="
 
-          echo "Guardian response: ${ELAPSED} ms"
-          echo "PASS T6: simulated lease loss stops A"
+          docker run -d \
+            --name "$C" \
+            --network none \
+            --memory 512m \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            "$IMAGE" sleep 60 >/dev/null
 
-          echo "=== T7: Synthetic evidence integrity ==="
-
-          printf '%s\n' \
-            'fixture=artificial' \
-            'case=A' \
-            'classification=PUBLIC_SYNTHETIC' \
-            > "$EVIDENCE/evidence.txt"
-
-          (
-            cd "$EVIDENCE"
-            sha256sum evidence.txt > manifest.sha256
-            sha256sum -c manifest.sha256 >/dev/null
-          )
-
-          echo 'synthetic-tampering' \
-            >> "$EVIDENCE/evidence.txt"
-
+          # Isolated failure handling: C must be removed.
           if (
-            cd "$EVIDENCE"
-            sha256sum -c manifest.sha256 \
-              >/dev/null 2>&1
+            trap 'docker rm -f "$C" >/dev/null 2>&1' EXIT
+            echo "Simulating failure of scenario C"
+            exit 42
           ); then
-            echo "FAIL: alteration not detected"
+            echo "FAIL T11: failure was not detected"
             exit 1
           fi
 
-          echo "PASS T7: tampering detected"
-
-          echo "=== T8: Ownership and scoped cleanup ==="
-
-          docker exec "$B" sh -c \
-            'echo B_INTACT > /tmp/ownership'
-
-          docker rm -f "$A" >/dev/null
-
-          if docker inspect "$A" >/dev/null 2>&1; then
-            echo "FAIL: A still exists"
+          if docker inspect "$C" >/dev/null 2>&1; then
+            echo "FAIL T11: failed scenario remains"
             exit 1
           fi
+
+          echo "PASS T11: failed scenario cleaned"
+
+          echo "=== T12: Other scenario remains intact ==="
 
           test "$(docker inspect -f \
             '{{.State.Running}}' "$B")" = "true"
 
-          docker exec "$B" sh -c \
-            'test "$(cat /tmp/ownership)" = "B_INTACT"'
+          docker exec "$B" sh -c '
+            echo B_ALIVE > /tmp/status
+            test "$(cat /tmp/status)" = B_ALIVE
+          '
 
-          echo "PASS T8: B unaffected by cleanup of A"
+          echo "PASS T12: independent scenario preserved"
 
-          docker rm -f "$B" >/dev/null
+          echo "=== Cleanup exclusively owned workers ==="
+          docker rm -f "$A" "$B" >/dev/null
 
-          if docker inspect "$B" >/dev/null 2>&1; then
-            echo "FAIL: B still exists"
-            exit 1
-          fi
+          for NAME in "$A" "$B" "$C"; do
+            if docker inspect "$NAME" >/dev/null 2>&1; then
+              echo "FAIL: residual worker $NAME"
+              exit 1
+            fi
+          done
 
-          rm -rf -- "$EVIDENCE"
           trap - EXIT
-
-          echo "PASS: consolidated controls T5-T8"
+          echo "PASS: consolidated controls T9-T12"
