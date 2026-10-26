@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: synthetic-integral-${{ github.ref }}-${{ github.run_id }}
+  group: synthetic-integral-validation
   cancel-in-progress: false
 
 jobs:
@@ -41,15 +41,18 @@ jobs:
       MAX_LINK_SECONDS: "30"
       MAX_BLOCK_BYTES: "65536"
       MAX_CLEANUP_SECONDS: "120"
+      CANDIDATE_SHA_INPUT: ${{ inputs.candidate_sha }}
+      EXECUTION_ORDER_INPUT: ${{ inputs.execution_order }}
 
     steps:
       - name: Admission guard
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ inputs.candidate_sha }}" = "$GITHUB_SHA"
-          test -n "${{ inputs.execution_order }}"
-          case "${{ inputs.execution_order }}" in
+          [[ "$CANDIDATE_SHA_INPUT" =~ ^[0-9a-f]{40}$ ]]
+          test "$CANDIDATE_SHA_INPUT" = "$GITHUB_SHA"
+          test -n "$EXECUTION_ORDER_INPUT"
+          case "$EXECUTION_ORDER_INPUT" in
             *[!A-Za-z0-9._-]*|'') echo "invalid public execution order id"; exit 64 ;;
           esac
           echo "admission=accepted-for-authorized-candidate"
@@ -58,13 +61,53 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           PREFIX="synthetic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ROOT="$RUNNER_TEMP/$PREFIX"
-          mkdir -p "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
-          chmod 700 "$ROOT" "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
+          test ! -e "$ROOT" && test ! -L "$ROOT"
+          mkdir -m 700 "$ROOT"
+          mkdir -m 700 "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
           printf '%s\n' "$PREFIX" > "$ROOT/state/prefix"
+          : > "$ROOT/state/owned-ids"
+          python3 - <<'PY'
+          import os, pathlib, time
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/('synthetic-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
+          (root/'state'/'cycle-start').write_text(str(time.monotonic()), encoding='utf-8')
+          PY
           printf 'ROOT=%s\n' "$ROOT" >> "$GITHUB_ENV"
           printf 'OWNED_PREFIX=%s\n' "$PREFIX" >> "$GITHUB_ENV"
+          cat > "$ROOT/state/control.sh" <<'SH'
+          set -euo pipefail
+          clock_ms() {
+            python3 -c 'import time; print(time.monotonic_ns()//1000000)'
+          }
+          check_root() {
+            test -n "${ROOT:-}" && test -n "${OWNED_PREFIX:-}" || return 1
+            test "$ROOT" = "$RUNNER_TEMP/$OWNED_PREFIX" || return 1
+            test ! -L "$ROOT" && test -d "$ROOT/state" || return 1
+            test "$(cat "$ROOT/state/prefix")" = "$OWNED_PREFIX"
+          }
+          # Invoke the real CLI as a separate process; never recurse into a shell function.
+          dc() { timeout --signal=TERM --kill-after=1s 5s docker "$@"; }
+          owned_rm() {
+            check_root || return 1
+            local started now id ids owner failed=0
+            started=$(clock_ms) || return 1
+            while IFS= read -r id; do
+              [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
+              now=$(clock_ms) || return 1
+              if (( now-started >= MAX_CLEANUP_SECONDS*1000 )); then return 1; fi
+              ids=$(dc ps -aq --no-trunc) || return 1
+              if ! printf '%s\n' "$ids" | grep -Fx "$id" >/dev/null; then continue; fi
+              owner=$(dc inspect -f '{{index .Config.Labels "synthetic.cycle"}}' "$id") || return 1
+              test "$owner" = "$OWNED_PREFIX" || return 1
+              dc rm -f "$id" >/dev/null || failed=1
+            done < "$ROOT/state/owned-ids"
+            now=$(clock_ms) || return 1
+            (( now-started <= MAX_CLEANUP_SECONDS*1000 )) || return 1
+            return "$failed"
+          }
+          SH
 
       - name: Generate public synthetic fixtures
         shell: bash
@@ -83,50 +126,69 @@ jobs:
             {"case":"case-07","subject":"synthetic-g","value":"eta"},
             {"case":"case-08","subject":"synthetic-h","value":"theta"}
           ]
-          out=root/"fixtures"/"fixtures.json"
-          out.write_text(json.dumps(fixtures,separators=(",",":")),encoding="utf-8")
-          assert out.stat().st_size <= int(os.environ["MAX_CASE_BYTES"])
-          digest=hashlib.sha256(out.read_bytes()).hexdigest()
-          (root/"evidence"/"fixture.sha256").write_text(digest+"  fixtures.json\n",encoding="utf-8")
+          data=json.dumps(fixtures,separators=(",",":"),ensure_ascii=True).encode()
+          if len(data)>int(os.environ['MAX_FIXTURE_BYTES']): raise SystemExit('fixture limit')
+          for case in fixtures:
+            if len(json.dumps(case,separators=(",",":")).encode())>int(os.environ['MAX_CASE_BYTES']):
+              raise SystemExit('case limit')
+          if len(data)>int(os.environ['MAX_CYCLE_BYTES']): raise SystemExit('cycle input limit')
+          out=root/'fixtures'/'fixtures.json'
+          with out.open('xb') as f: f.write(data)
+          (root/'evidence'/'fixture.sha256').write_text(hashlib.sha256(data).hexdigest()+'  ../fixtures/fixtures.json\n',encoding='utf-8')
           PY
+          (cd "$ROOT/evidence" && sha256sum -c fixture.sha256 >/dev/null)
 
       - name: Static host inventory before
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "phase=before"
-            echo "cpu=$(nproc)"
-            echo "mem_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-            echo "disk_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2{print $4}')"
-            echo "kernel=$(uname -srm)"
-          } > "$ROOT/evidence/host-before.txt"
-          docker ps -a --format '{{.Names}}' | sort > "$ROOT/evidence/docker-before.txt"
+          source "$ROOT/state/control.sh"
+          check_root
+          CPU=$(nproc)
+          MEM_KIB=$(awk '/MemTotal:/{print $2}' /proc/meminfo)
+          DISK_KIB=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2{print $4}')
+          test "$CPU" -ge 4
+          test "$MEM_KIB" -ge 8388608
+          test "$DISK_KIB" -ge 4194304
+          printf 'cpu=%s\nmem_kib=%s\ndisk_kib=%s\n' "$CPU" "$MEM_KIB" "$DISK_KIB" > "$ROOT/evidence/host-before.txt"
+          dc ps -a --no-trunc --format '{{.ID}} {{.Names}}' > "$ROOT/state/docker-before.raw"
+          sort "$ROOT/state/docker-before.raw" > "$ROOT/evidence/docker-before.txt"
+          for suffix in worker peer receiver; do
+            if awk '{print $2}' "$ROOT/evidence/docker-before.txt" | grep -Fxq "${OWNED_PREFIX}-${suffix}"; then
+              echo 'resource name collision'; exit 1
+            fi
+          done
 
       - name: Run integral synthetic matrix
         shell: bash
         run: |
           set -euo pipefail
+          source "$ROOT/state/control.sh"
+          check_root
           IMAGE="$PUBLIC_IMAGE"
           PREFIX="$OWNED_PREFIX"
           WORKER="${PREFIX}-worker"
           PEER="${PREFIX}-peer"
-          RECEIVER="${PREFIX}-receiver"
-          START_MS=$(date +%s%3N)
-
-          owned_rm() {
-            for n in "$WORKER" "$PEER" "$RECEIVER"; do
-              case "$n" in "${PREFIX}"-*) docker rm -f "$n" >/dev/null 2>&1 || true ;; esac
-            done
+          START_MS=$(clock_ms)
+          finalize() {
+            local rc=$?
+            trap - EXIT INT TERM
+            if ! owned_rm; then rc=1; fi
+            exit "$rc"
           }
-          trap owned_rm EXIT
+          trap finalize EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
 
-          docker pull "$IMAGE"
+          timeout --signal=TERM --kill-after=1s 60s docker pull "$IMAGE" >/dev/null
 
           run_worker() {
             local name="$1"
-            docker run -d \
+            local id
+            id=$(dc create \
               --name "$name" \
+              --label "synthetic.cycle=$OWNED_PREFIX" \
+              --log-driver none \
               --network none \
               --cpus 1 \
               --memory 512m \
@@ -137,56 +199,60 @@ jobs:
               --cap-drop ALL \
               --security-opt no-new-privileges \
               --user 65534:65534 \
-              "$IMAGE" sh -c 'while :; do sleep 1; done' >/dev/null
+              "$IMAGE" sleep "$MAX_WORKER_SECONDS") || return 1
+            [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
+            printf '%s\n' "$id" >> "$ROOT/state/owned-ids" || return 1
+            dc start "$id" >/dev/null || return 1
+            printf '%s\n' "$id"
           }
 
-          run_worker "$WORKER"
-          run_worker "$PEER"
+          WORKER=$(run_worker "${PREFIX}-worker")
+          PEER=$(run_worker "${PREFIX}-peer")
 
-          docker exec "$WORKER" sh -c 'echo alpha >/tmp/owned'
-          ! docker exec "$PEER" sh -c 'test -e /tmp/owned'
+          dc exec "$WORKER" sh -c 'echo alpha >/tmp/owned'
+          dc exec "$PEER" sh -ec 'test -d /tmp; test ! -e /tmp/owned'
 
-          docker exec "$WORKER" sh -c 'echo granted >/tmp/grant'
-          test "$(docker exec "$WORKER" cat /tmp/grant)" = granted
+          dc exec "$WORKER" sh -c 'echo granted >/tmp/grant'
+          test "$(dc exec "$WORKER" cat /tmp/grant)" = granted
 
-          T0=$(date +%s%3N)
-          docker exec "$WORKER" rm /tmp/grant
-          docker rm -f "$WORKER" >/dev/null
-          T1=$(date +%s%3N)
+          T0=$(clock_ms)
+          dc exec "$WORKER" rm /tmp/grant
+          dc rm -f "$WORKER" >/dev/null
+          T1=$(clock_ms)
           STOP_MS=$((T1-T0))
           test "$STOP_MS" -le "$MAX_STOP_MS"
-          run_worker "$WORKER"
+          WORKER=$(run_worker "${PREFIX}-worker")
 
-          docker exec "$WORKER" sh -c 'printf synthetic-only >/tmp/incidental'
-          test "$(docker exec "$WORKER" cat /tmp/incidental)" = synthetic-only
+          dc exec "$WORKER" sh -c 'printf synthetic-only >/tmp/incidental'
+          test "$(dc exec "$WORKER" cat /tmp/incidental)" = synthetic-only
 
-          docker exec "$WORKER" sh -c 'echo lifecycle >/tmp/state'
-          docker rm -f "$WORKER" >/dev/null
-          run_worker "$WORKER"
-          ! docker exec "$WORKER" sh -c 'test -e /tmp/state'
+          dc exec "$WORKER" sh -c 'echo lifecycle >/tmp/state'
+          dc rm -f "$WORKER" >/dev/null
+          WORKER=$(run_worker "${PREFIX}-worker")
+          dc exec "$WORKER" sh -ec 'test -d /tmp; test ! -e /tmp/state'
 
-          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$WORKER")" = none
-          docker exec "$WORKER" sh -c 'test ! -e /var/run/docker.sock'
-          docker exec "$WORKER" sh -c 'ip route 2>/dev/null | grep -q "^default" && exit 1 || exit 0'
-          docker exec "$WORKER" sh -c 'wget -T 2 -q -O /dev/null http://1.1.1.1/ >/dev/null 2>&1 && exit 1 || exit 0'
+          test "$(dc inspect -f '{{.HostConfig.NetworkMode}}' "$WORKER")" = none
+          dc exec "$WORKER" sh -c 'test ! -e /var/run/docker.sock'
+          dc exec "$WORKER" sh -ec 'command -v ip >/dev/null; ip -4 route > /tmp/routes4; ip -6 route > /tmp/routes6; test ! -s /tmp/routes4; test ! -s /tmp/routes6; test ! -e /sys/class/net/eth0'
+          # No external connection attempt: route inspection is not universal egress proof.
 
-          docker exec "$WORKER" sh -c 'printf artificial-export >/tmp/export'
-          docker exec "$WORKER" cat /tmp/export > "$ROOT/evidence/artificial-export.txt"
-          sha256sum "$ROOT/evidence/artificial-export.txt" > "$ROOT/evidence/artificial-export.sha256"
+          dc exec "$WORKER" sh -c 'printf artificial-export >/tmp/export'
+          dc exec "$WORKER" cat /tmp/export > "$ROOT/evidence/artificial-export.txt"
+          (cd "$ROOT/evidence" && sha256sum artificial-export.txt > artificial-export.sha256 && sha256sum -c artificial-export.sha256 >/dev/null)
 
           printf '%s\n' "$IMAGE" > "$ROOT/evidence/image.txt"
-          docker inspect "$WORKER" > "$ROOT/evidence/worker-inspect.json"
+          dc inspect -f '{{.HostConfig.NetworkMode}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}} {{.Config.User}}' "$WORKER" > "$ROOT/evidence/worker-config.txt"
 
-          docker rm -f "$WORKER" >/dev/null
-          test "$(docker inspect -f '{{.State.Running}}' "$PEER")" = true
-          docker rm -f "$PEER" >/dev/null
+          dc rm -f "$WORKER" >/dev/null
+          test "$(dc inspect -f '{{.State.Running}}' "$PEER")" = true
+          dc rm -f "$PEER" >/dev/null
 
-          END_MS=$(date +%s%3N)
+          END_MS=$(clock_ms)
           ELAPSED_MS=$((END_MS-START_MS))
           test "$ELAPSED_MS" -le $((MAX_CYCLE_SECONDS*1000))
 
-          trap - EXIT
           owned_rm
+          trap - EXIT INT TERM
           printf 'stop_ms=%s\ncycle_ms=%s\n' "$STOP_MS" "$ELAPSED_MS" > "$ROOT/evidence/timings.txt"
 
       - name: Inventory after and residue gate
@@ -194,38 +260,64 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "${ROOT:-}"
-          PREFIX="${OWNED_PREFIX:-synthetic-invalid}"
-          {
-            echo "phase=after"
-            echo "cpu=$(nproc)"
-            echo "mem_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-            echo "disk_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2{print $4}')"
-          } > "$ROOT/evidence/host-after.txt"
-          docker ps -a --format '{{.Names}}' | sort > "$ROOT/evidence/docker-after.txt"
-          if docker ps -a --format '{{.Names}}' | grep -E "^${PREFIX}-" > "$ROOT/evidence/residue.txt"; then
-            echo "owned residue detected"
-            exit 1
-          fi
-          : > "$ROOT/evidence/residue.txt"
+          # Admission/preparation may have failed; never invent a root for cleanup.
+          if test -z "${ROOT:-}"; then echo 'preparation_not_completed=true'; exit 1; fi
+          source "$ROOT/state/control.sh"
+          check_root
+          cleanup_rc=0
+          owned_rm || cleanup_rc=1
+          dc ps -a --no-trunc --format '{{.ID}} {{.Names}}' > "$ROOT/state/docker-after.raw"
+          sort "$ROOT/state/docker-after.raw" > "$ROOT/evidence/docker-after.txt"
+          dc ps -aq --no-trunc --filter "label=synthetic.cycle=$OWNED_PREFIX" > "$ROOT/evidence/residue.txt"
+          test ! -s "$ROOT/evidence/residue.txt"
+          # Prove pre-existing container identity/name inventory is unchanged; never repair it.
+          cmp "$ROOT/evidence/docker-before.txt" "$ROOT/evidence/docker-after.txt"
+          test "$cleanup_rc" -eq 0
+          python3 - <<'PY'
+          import os,pathlib,time
+          r=pathlib.Path(os.environ['ROOT'])
+          elapsed=time.monotonic()-float((r/'state'/'cycle-start').read_text())
+          if elapsed>int(os.environ['MAX_CYCLE_SECONDS']): raise SystemExit('cycle deadline exceeded')
+          PY
 
       - name: Seal minimized synthetic evidence locally
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          test -d "$ROOT/evidence"
-          find "$ROOT/evidence" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > "$ROOT/evidence/SHA256SUMS"
-          test "$(du -sb "$ROOT/evidence" | awk '{print $1}')" -le "$MAX_CYCLE_BYTES"
-          echo "Evidence remains local to the ephemeral runner; upload-artifact is intentionally absent."
+          test -n "${ROOT:-}" && test -d "$ROOT/evidence"
+          python3 - <<'PY'
+          import hashlib,os,pathlib,time
+          root=pathlib.Path(os.environ['ROOT']); evidence=root/'evidence'
+          files=sorted(p for p in evidence.iterdir() if p.name!='SHA256SUMS')
+          if not files or any(p.is_symlink() or not p.is_file() for p in files):
+            raise SystemExit('invalid evidence inventory')
+          manifest=''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in files)
+          tmp=root/'state'/'manifest.tmp'
+          tmp.write_text(manifest,encoding='utf-8'); tmp.replace(evidence/'SHA256SUMS')
+          total=0
+          for p in root.rglob('*'):
+            if p.is_symlink(): raise SystemExit('symlink refused')
+            if p.is_file(): total+=p.stat().st_size
+          if total>int(os.environ['MAX_CYCLE_BYTES']): raise SystemExit('cycle storage limit')
+          elapsed=time.monotonic()-float((root/'state'/'cycle-start').read_text())
+          if elapsed>int(os.environ['MAX_CYCLE_SECONDS']): raise SystemExit('cycle deadline exceeded')
+          PY
+          (cd "$ROOT/evidence" && sha256sum -c SHA256SUMS >/dev/null)
+          echo 'evidence=local_ephemeral_only'
 
       - name: Final safety statement
         if: ${{ always() }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "synthetic_only=true"
-          echo "private_inputs=false"
-          echo "cache_used=false"
-          echo "artifact_upload=false"
-          echo "execution_requires_separate_order=true"
+          echo 'coverage=INCOMPLETE'
+          echo 'runtime_effectiveness=NOT_PROVEN'
+          echo 'native_acceptance=NOT_EXECUTED'
+          echo 'receiver_rate_connection_limits=DECLARED_ONLY'
+          echo 'authorization_link_lifecycle_controls=DECLARED_ONLY'
+          echo 'independent_guardian_and_recovery=NOT_PROVEN'
+          echo 'operational_readiness=BLOCKED'
+          # Existing examples cannot constitute a complete acceptance campaign.
+          # Even a future accidental removal of the admission lock must not report success.
+          exit 78
