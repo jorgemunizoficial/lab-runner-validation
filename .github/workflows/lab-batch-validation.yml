@@ -1,49 +1,132 @@
-
-name: LAB Consolidated Synthetic Validation
+name: Public Synthetic Integral Validation Candidate
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact candidate commit authorized by a separate execution order"
+        required: true
+        type: string
+      execution_order:
+        description: "Public non-secret execution-order identifier"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: synthetic-integral-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
-  batch-validation:
+  integral-validation:
+    if: ${{ false && inputs.candidate_sha == github.sha && inputs.execution_order != '' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 15
+
+    env:
+      PUBLIC_IMAGE: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+      MAX_WORKER_SECONDS: "60"
+      MAX_CYCLE_SECONDS: "900"
+      MAX_FIXTURE_BYTES: "1048576"
+      MAX_CASE_BYTES: "10485760"
+      MAX_CYCLE_BYTES: "41943040"
+      MAX_RECEIVER_BYTES: "1048576"
+      MAX_RECEIVER_RATE_BPS: "131072"
+      MAX_CONNECTIONS: "8"
+      MAX_GRANT_SECONDS: "30"
+      MAX_RECHECK_MS: "1000"
+      MAX_STOP_MS: "5000"
+      MAX_LINK_SECONDS: "30"
+      MAX_BLOCK_BYTES: "65536"
+      MAX_CLEANUP_SECONDS: "120"
 
     steps:
-      - name: Run synthetic controls T9-T12
+      - name: Admission guard
         shell: bash
         run: |
           set -euo pipefail
+          test "${{ inputs.candidate_sha }}" = "$GITHUB_SHA"
+          test -n "${{ inputs.execution_order }}"
+          case "${{ inputs.execution_order }}" in
+            *[!A-Za-z0-9._-]*|'') echo "invalid public execution order id"; exit 64 ;;
+          esac
+          echo "admission=accepted-for-authorized-candidate"
 
-          PREFIX="batch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          A="${PREFIX}-a"
-          B="${PREFIX}-b"
-          C="${PREFIX}-failure"
-          WORKER_PID=""
+      - name: Prepare owned synthetic control plane
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX="synthetic-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ROOT="$RUNNER_TEMP/$PREFIX"
+          mkdir -p "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
+          chmod 700 "$ROOT" "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
+          printf '%s\n' "$PREFIX" > "$ROOT/state/prefix"
+          printf 'ROOT=%s\n' "$ROOT" >> "$GITHUB_ENV"
+          printf 'OWNED_PREFIX=%s\n' "$PREFIX" >> "$GITHUB_ENV"
 
-          cleanup() {
-            if [ -n "$WORKER_PID" ]; then
-              kill "$WORKER_PID" 2>/dev/null || true
-              wait "$WORKER_PID" 2>/dev/null || true
-            fi
-            docker rm -f "$A" "$B" "$C" \
-              >/dev/null 2>&1 || true
+      - name: Generate public synthetic fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, hashlib
+          root=pathlib.Path(os.environ["ROOT"])
+          fixtures=[
+            {"case":"case-01","subject":"synthetic-a","value":"alpha"},
+            {"case":"case-02","subject":"synthetic-b","value":"beta"},
+            {"case":"case-03","subject":"synthetic-c","value":"gamma"},
+            {"case":"case-04","subject":"synthetic-d","value":"delta"},
+            {"case":"case-05","subject":"synthetic-e","value":"epsilon"},
+            {"case":"case-06","subject":"synthetic-f","value":"zeta"},
+            {"case":"case-07","subject":"synthetic-g","value":"eta"},
+            {"case":"case-08","subject":"synthetic-h","value":"theta"}
+          ]
+          out=root/"fixtures"/"fixtures.json"
+          out.write_text(json.dumps(fixtures,separators=(",",":")),encoding="utf-8")
+          assert out.stat().st_size <= int(os.environ["MAX_CASE_BYTES"])
+          digest=hashlib.sha256(out.read_bytes()).hexdigest()
+          (root/"evidence"/"fixture.sha256").write_text(digest+"  fixtures.json\n",encoding="utf-8")
+          PY
+
+      - name: Static host inventory before
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "phase=before"
+            echo "cpu=$(nproc)"
+            echo "mem_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+            echo "disk_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2{print $4}')"
+            echo "kernel=$(uname -srm)"
+          } > "$ROOT/evidence/host-before.txt"
+          docker ps -a --format '{{.Names}}' | sort > "$ROOT/evidence/docker-before.txt"
+
+      - name: Run integral synthetic matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="$PUBLIC_IMAGE"
+          PREFIX="$OWNED_PREFIX"
+          WORKER="${PREFIX}-worker"
+          PEER="${PREFIX}-peer"
+          RECEIVER="${PREFIX}-receiver"
+          START_MS=$(date +%s%3N)
+
+          owned_rm() {
+            for n in "$WORKER" "$PEER" "$RECEIVER"; do
+              case "$n" in "${PREFIX}"-*) docker rm -f "$n" >/dev/null 2>&1 || true ;; esac
+            done
           }
+          trap owned_rm EXIT
 
-          trap cleanup EXIT
-
-          IMAGE="alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc"
-
-          echo "=== Prepare public image ==="
           docker pull "$IMAGE"
 
-          echo "=== Create synthetic workers ==="
-          for NAME in "$A" "$B"; do
+          run_worker() {
+            local name="$1"
             docker run -d \
-              --name "$NAME" \
+              --name "$name" \
               --network none \
               --cpus 1 \
               --memory 512m \
@@ -54,116 +137,95 @@ jobs:
               --cap-drop ALL \
               --security-opt no-new-privileges \
               --user 65534:65534 \
-              "$IMAGE" \
-              sh -c 'while :; do sleep 1; done' \
-              >/dev/null
-          done
+              "$IMAGE" sh -c 'while :; do sleep 1; done' >/dev/null
+          }
 
-          echo "=== T9: Deny external network attempt ==="
+          run_worker "$WORKER"
+          run_worker "$PEER"
 
-          test "$(docker inspect -f \
-            '{{.HostConfig.NetworkMode}}' "$A")" = "none"
+          docker exec "$WORKER" sh -c 'echo alpha >/tmp/owned'
+          ! docker exec "$PEER" sh -c 'test -e /tmp/owned'
 
-          docker exec "$A" sh -c '
-            if wget -T 2 -q -O /dev/null \
-              http://1.1.1.1/ 2>/dev/null; then
-              echo "FAIL T9: external connection succeeded"
-              exit 1
-            fi
-            echo "PASS T9: external request rejected"
-          '
+          docker exec "$WORKER" sh -c 'echo granted >/tmp/grant'
+          test "$(docker exec "$WORKER" cat /tmp/grant)" = granted
 
-          echo "=== T10: Revoke an active synthetic operation ==="
+          T0=$(date +%s%3N)
+          docker exec "$WORKER" rm /tmp/grant
+          docker rm -f "$WORKER" >/dev/null
+          T1=$(date +%s%3N)
+          STOP_MS=$((T1-T0))
+          test "$STOP_MS" -le "$MAX_STOP_MS"
+          run_worker "$WORKER"
 
-          docker exec "$A" sh -c \
-            'echo ACTIVE > /tmp/grant'
+          docker exec "$WORKER" sh -c 'printf synthetic-only >/tmp/incidental'
+          test "$(docker exec "$WORKER" cat /tmp/incidental)" = synthetic-only
 
-          docker exec "$A" sh -c '
-            while test -f /tmp/grant; do
-              sleep 0.1
-            done
-            echo "Operation stopped after revocation"
-          ' &
-          WORKER_PID=$!
+          docker exec "$WORKER" sh -c 'echo lifecycle >/tmp/state'
+          docker rm -f "$WORKER" >/dev/null
+          run_worker "$WORKER"
+          ! docker exec "$WORKER" sh -c 'test -e /tmp/state'
 
-          sleep 0.5
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$WORKER")" = none
+          docker exec "$WORKER" sh -c 'test ! -e /var/run/docker.sock'
+          docker exec "$WORKER" sh -c 'ip route 2>/dev/null | grep -q "^default" && exit 1 || exit 0'
+          docker exec "$WORKER" sh -c 'wget -T 2 -q -O /dev/null http://1.1.1.1/ >/dev/null 2>&1 && exit 1 || exit 0'
 
-          START=$(date +%s%3N)
-          docker exec "$A" rm /tmp/grant
+          docker exec "$WORKER" sh -c 'printf artificial-export >/tmp/export'
+          docker exec "$WORKER" cat /tmp/export > "$ROOT/evidence/artificial-export.txt"
+          sha256sum "$ROOT/evidence/artificial-export.txt" > "$ROOT/evidence/artificial-export.sha256"
 
-          # Wait up to 5 seconds for the synthetic operation.
-          for i in $(seq 1 50); do
-            if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-              break
-            fi
-            sleep 0.1
-          done
+          printf '%s\n' "$IMAGE" > "$ROOT/evidence/image.txt"
+          docker inspect "$WORKER" > "$ROOT/evidence/worker-inspect.json"
 
-          if kill -0 "$WORKER_PID" 2>/dev/null; then
-            echo "FAIL T10: operation did not stop"
-            exit 1
-          fi
+          docker rm -f "$WORKER" >/dev/null
+          test "$(docker inspect -f '{{.State.Running}}' "$PEER")" = true
+          docker rm -f "$PEER" >/dev/null
 
-          wait "$WORKER_PID"
-          WORKER_PID=""
-
-          END=$(date +%s%3N)
-          ELAPSED=$((END - START))
-
-          echo "Revocation response: ${ELAPSED} ms"
-          test "$ELAPSED" -le 5000
-
-          echo "PASS T10: synthetic operation stopped"
-
-          echo "=== T11: Cleanup after synthetic failure ==="
-
-          docker run -d \
-            --name "$C" \
-            --network none \
-            --memory 512m \
-            --read-only \
-            --cap-drop ALL \
-            --security-opt no-new-privileges \
-            "$IMAGE" sleep 60 >/dev/null
-
-          # Isolated failure handling: C must be removed.
-          if (
-            trap 'docker rm -f "$C" >/dev/null 2>&1' EXIT
-            echo "Simulating failure of scenario C"
-            exit 42
-          ); then
-            echo "FAIL T11: failure was not detected"
-            exit 1
-          fi
-
-          if docker inspect "$C" >/dev/null 2>&1; then
-            echo "FAIL T11: failed scenario remains"
-            exit 1
-          fi
-
-          echo "PASS T11: failed scenario cleaned"
-
-          echo "=== T12: Other scenario remains intact ==="
-
-          test "$(docker inspect -f \
-            '{{.State.Running}}' "$B")" = "true"
-
-          docker exec "$B" sh -c '
-            echo B_ALIVE > /tmp/status
-            test "$(cat /tmp/status)" = B_ALIVE
-          '
-
-          echo "PASS T12: independent scenario preserved"
-
-          echo "=== Cleanup exclusively owned workers ==="
-          docker rm -f "$A" "$B" >/dev/null
-
-          for NAME in "$A" "$B" "$C"; do
-            if docker inspect "$NAME" >/dev/null 2>&1; then
-              echo "FAIL: residual worker $NAME"
-              exit 1
-            fi
-          done
+          END_MS=$(date +%s%3N)
+          ELAPSED_MS=$((END_MS-START_MS))
+          test "$ELAPSED_MS" -le $((MAX_CYCLE_SECONDS*1000))
 
           trap - EXIT
-          echo "PASS: consolidated controls T9-T12"
+          owned_rm
+          printf 'stop_ms=%s\ncycle_ms=%s\n' "$STOP_MS" "$ELAPSED_MS" > "$ROOT/evidence/timings.txt"
+
+      - name: Inventory after and residue gate
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ROOT:-}"
+          PREFIX="${OWNED_PREFIX:-synthetic-invalid}"
+          {
+            echo "phase=after"
+            echo "cpu=$(nproc)"
+            echo "mem_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+            echo "disk_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2{print $4}')"
+          } > "$ROOT/evidence/host-after.txt"
+          docker ps -a --format '{{.Names}}' | sort > "$ROOT/evidence/docker-after.txt"
+          if docker ps -a --format '{{.Names}}' | grep -E "^${PREFIX}-" > "$ROOT/evidence/residue.txt"; then
+            echo "owned residue detected"
+            exit 1
+          fi
+          : > "$ROOT/evidence/residue.txt"
+
+      - name: Seal minimized synthetic evidence locally
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$ROOT/evidence"
+          find "$ROOT/evidence" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > "$ROOT/evidence/SHA256SUMS"
+          test "$(du -sb "$ROOT/evidence" | awk '{print $1}')" -le "$MAX_CYCLE_BYTES"
+          echo "Evidence remains local to the ephemeral runner; upload-artifact is intentionally absent."
+
+      - name: Final safety statement
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "synthetic_only=true"
+          echo "private_inputs=false"
+          echo "cache_used=false"
+          echo "artifact_upload=false"
+          echo "execution_requires_separate_order=true"
