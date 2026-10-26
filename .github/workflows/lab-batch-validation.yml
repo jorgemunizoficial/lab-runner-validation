@@ -43,6 +43,7 @@ jobs:
       MAX_CLEANUP_SECONDS: "120"
       CANDIDATE_SHA_INPUT: ${{ inputs.candidate_sha }}
       EXECUTION_ORDER_INPUT: ${{ inputs.execution_order }}
+      MODEL_SOURCE_SHA256: 675a97245692bc7b1e3a4ee28d62482a9a1443554472750a51636fdc9d30237e
 
     steps:
       - name: Admission guard
@@ -68,7 +69,7 @@ jobs:
           mkdir -m 700 "$ROOT"
           mkdir -m 700 "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
           printf '%s\n' "$PREFIX" > "$ROOT/state/prefix"
-          : > "$ROOT/state/owned-ids"
+          mkdir -m 700 "$ROOT/state/ledger"
           python3 - <<'PY'
           import os, pathlib, time
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/('synthetic-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
@@ -87,22 +88,73 @@ jobs:
             test ! -L "$ROOT" && test -d "$ROOT/state" || return 1
             test "$(cat "$ROOT/state/prefix")" = "$OWNED_PREFIX"
           }
-          # Invoke the real CLI as a separate process; never recurse into a shell function.
-          dc() { timeout --signal=TERM --kill-after=1s 5s docker "$@"; }
+          # Calls reserve the cleanup window. The host remains a shared failure domain.
+          deadline_seconds() {
+            CONTROL_PHASE="${CONTROL_PHASE:-work}" DC_SECONDS="${DC_SECONDS:-5}" CLEANUP_DEADLINE_MS="${CLEANUP_DEADLINE_MS:-0}" python3 - <<'PY'
+          import os,pathlib,time
+          root=pathlib.Path(os.environ['ROOT'])
+          now=time.monotonic()
+          start=float((root/'state'/'cycle-start').read_text())
+          end=start+int(os.environ['MAX_CYCLE_SECONDS'])
+          if os.environ['CONTROL_PHASE']!='cleanup': end-=int(os.environ['MAX_CLEANUP_SECONDS'])
+          cleanup=int(os.environ['CLEANUP_DEADLINE_MS'])/1000
+          if cleanup: end=min(end,cleanup)
+          remaining=end-now-1.0
+          if remaining<=0: raise SystemExit('deadline admission refused')
+          print(min(float(os.environ['DC_SECONDS']),remaining))
+          PY
+          }
+          dc() {
+            local seconds
+            seconds=$(deadline_seconds) || return 1
+            timeout --signal=TERM --kill-after=1s "${seconds}s" docker "$@"
+          }
+          record_owned() {
+            CREATED_ID="$1" CREATED_NAME="$2" python3 - <<'PY'
+          import json,os,pathlib,re,time
+          root=pathlib.Path(os.environ['ROOT']); identifier=os.environ['CREATED_ID']
+          if not re.fullmatch('[0-9a-f]{64}',identifier): raise SystemExit('invalid resource identity')
+          before={line.split()[0] for line in (root/'evidence'/'docker-before.txt').read_text().splitlines()}
+          if identifier in before: raise SystemExit('pre-existing identity refused')
+          receipt={'id':identifier,'cycle':os.environ['OWNED_PREFIX'],'candidate':os.environ['GITHUB_SHA'],
+                   'name':os.environ['CREATED_NAME'],'created_monotonic':time.monotonic(),'owner':'public-synthetic-executor'}
+          target=root/'state'/'ledger'/(identifier+'.json')
+          with target.open('xb') as f:
+              f.write(json.dumps(receipt,sort_keys=True,separators=(',',':')).encode());f.flush();os.fsync(f.fileno())
+          target.chmod(0o400)
+          PY
+          }
           owned_rm() {
             check_root || return 1
-            local started now id ids owner failed=0
+            local started now id ids owner candidate failed=0 CONTROL_PHASE=cleanup CLEANUP_DEADLINE_MS
             started=$(clock_ms) || return 1
-            while IFS= read -r id; do
-              [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
+            CLEANUP_DEADLINE_MS=$((started+MAX_CLEANUP_SECONDS*1000))
+            ids=$(python3 - <<'PY'
+          import json,os,pathlib,re
+          root=pathlib.Path(os.environ['ROOT'])
+          for receipt in sorted((root/'state'/'ledger').iterdir()):
+              if receipt.is_symlink() or not receipt.is_file(): raise SystemExit('invalid ledger entry')
+              data=json.loads(receipt.read_bytes())
+              identifier=data['id']
+              if not re.fullmatch('[0-9a-f]{64}',identifier): raise SystemExit('invalid identity')
+              if receipt.name!=identifier+'.json' or data['cycle']!=os.environ['OWNED_PREFIX']:
+                  raise SystemExit('ledger mismatch')
+              if data['candidate']!=os.environ['GITHUB_SHA'] or data['owner']!='public-synthetic-executor':
+                  raise SystemExit('ownership mismatch')
+              print(identifier)
+          PY
+            ) || return 1
+            for id in $ids; do
               now=$(clock_ms) || return 1
-              if (( now-started >= MAX_CLEANUP_SECONDS*1000 )); then return 1; fi
-              ids=$(dc ps -aq --no-trunc) || return 1
-              if ! printf '%s\n' "$ids" | grep -Fx "$id" >/dev/null; then continue; fi
+              (( now < CLEANUP_DEADLINE_MS )) || return 1
+              local inventory
+              inventory=$(dc ps -aq --no-trunc) || return 1
+              if ! printf '%s\n' "$inventory" | grep -Fx "$id" >/dev/null; then continue; fi
               owner=$(dc inspect -f '{{index .Config.Labels "synthetic.cycle"}}' "$id") || return 1
-              test "$owner" = "$OWNED_PREFIX" || return 1
+              candidate=$(dc inspect -f '{{index .Config.Labels "synthetic.commit"}}' "$id") || return 1
+              test "$owner" = "$OWNED_PREFIX" && test "$candidate" = "$GITHUB_SHA" || return 1
               dc rm -f "$id" >/dev/null || failed=1
-            done < "$ROOT/state/owned-ids"
+            done
             now=$(clock_ms) || return 1
             (( now-started <= MAX_CLEANUP_SECONDS*1000 )) || return 1
             return "$failed"
@@ -159,6 +211,29 @@ jobs:
             fi
           done
 
+      - name: Prepare and inspect artificial logical controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$ROOT/state/control.sh"
+          check_root
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/synthetic/controls.py"
+          FETCH_SECONDS=$(DC_SECONDS=15 deadline_seconds)
+          curl --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time "$FETCH_SECONDS" \
+            --max-filesize 1048576 --fail --silent --show-error \
+            --output "$ROOT/state/model.py.tmp" "$URL"
+          printf '%s  %s\n' "$MODEL_SOURCE_SHA256" "$ROOT/state/model.py.tmp" | sha256sum -c - >/dev/null
+          mv "$ROOT/state/model.py.tmp" "$ROOT/state/model.py"
+          chmod 400 "$ROOT/state/model.py"
+          # This future step observes only an artificial host-side logical model.
+          # It is not independent supervision or an operational acceptance result.
+          MODEL_SECONDS=$(DC_SECONDS=60 deadline_seconds)
+          MODEL_DRIVER_ALLOWED=manual-locked-candidate \
+            timeout --signal=TERM --kill-after=1s "${MODEL_SECONDS}s" \
+            python3 -I "$ROOT/state/model.py" "$ROOT"
+
       - name: Run integral synthetic matrix
         shell: bash
         run: |
@@ -180,7 +255,7 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
 
-          timeout --signal=TERM --kill-after=1s 60s docker pull "$IMAGE" >/dev/null
+          DC_SECONDS=60 dc pull "$IMAGE" >/dev/null
 
           run_worker() {
             local name="$1"
@@ -188,6 +263,7 @@ jobs:
             id=$(dc create \
               --name "$name" \
               --label "synthetic.cycle=$OWNED_PREFIX" \
+              --label "synthetic.commit=$GITHUB_SHA" \
               --log-driver none \
               --network none \
               --cpus 1 \
@@ -201,7 +277,7 @@ jobs:
               --user 65534:65534 \
               "$IMAGE" sleep "$MAX_WORKER_SECONDS") || return 1
             [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
-            printf '%s\n' "$id" >> "$ROOT/state/owned-ids" || return 1
+            record_owned "$id" "$name" || return 1
             dc start "$id" >/dev/null || return 1
             printf '%s\n' "$id"
           }
@@ -314,9 +390,10 @@ jobs:
           echo 'coverage=INCOMPLETE'
           echo 'runtime_effectiveness=NOT_PROVEN'
           echo 'native_acceptance=NOT_EXECUTED'
-          echo 'receiver_rate_connection_limits=DECLARED_ONLY'
-          echo 'authorization_link_lifecycle_controls=DECLARED_ONLY'
+          echo 'receiver_rate_connection_limits=ARTIFICIAL_MODEL_ONLY'
+          echo 'authorization_link_lifecycle_controls=ARTIFICIAL_MODEL_ONLY'
           echo 'independent_guardian_and_recovery=NOT_PROVEN'
+          echo 'logical_clock_is_not_wall_time=true'
           echo 'operational_readiness=BLOCKED'
           # Existing examples cannot constitute a complete acceptance campaign.
           # Even a future accidental removal of the admission lock must not report success.
