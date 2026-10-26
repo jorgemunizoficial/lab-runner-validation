@@ -1,0 +1,31 @@
+# Local workspaces and ephemeral outputs
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+*.log
+*.pcap
+*.pcapng
+*.dump
+*.sql
+*.sqlite
+*.db
+.DS_Store
+Thumbs.db
+__pycache__/
+.pytest_cache/
+node_modules/
+dist/
+build/
+coverage/
+tmp/
+temp/
+.cache/
+*.swp
+
+# This is only a prevention layer. Review every diff for private content.
