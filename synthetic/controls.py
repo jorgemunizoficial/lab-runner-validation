@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import sys
+import signal
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -84,19 +85,133 @@ class Limits:
         return cls(**values)
 
 
-@dataclass
 class Budget:
-    limits: Limits
-    cases: dict[str, int] = field(default_factory=dict)
-    total: int = 0
+    """One ledger of retained artificial payloads and their file projections.
 
-    def reserve(self, case: str, size: int, artifact: bool = True) -> None:
-        require(type(size) is int and size >= 0)
+    A projection is the same owned artifact, not a second charge. Distinct
+    copies/derivatives have distinct IDs. Host logs and kernel memory are outside
+    this logical domain; the workflow checks its own total filesystem separately.
+    """
+    def __init__(self, limits: Limits):
+        self.limits = limits
+        self._artifacts: dict[str, tuple[str, bytes]] = {}
+        self.allowed = {"red-a", "red-b", "blue-a", "blue-b", "cycle-evidence"}
+
+    @property
+    def cases(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for case, data in self._artifacts.values():
+            totals[case] = totals.get(case, 0) + len(data)
+        return totals
+
+    @property
+    def total(self) -> int:
+        return sum(len(data) for _, data in self._artifacts.values())
+
+    def read(self, key: str) -> bytes:
+        require(key in self._artifacts)
+        return self._artifacts[key][1]
+
+    def put_many(self, changes: dict[str, tuple[str, bytes] | None]) -> None:
+        proposed = dict(self._artifacts)
+        for key, value in changes.items():
+            require(isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9_./-]+", key) is not None)
+            if value is None:
+                require(key in proposed)
+                del proposed[key]
+                continue
+            case, data = value
+            require(case in self.allowed and isinstance(data, bytes))
+            require(len(data) <= self.limits.artifact)
+            require(key not in proposed or proposed[key][0] == case)
+            proposed[key] = (case, data)
+        totals: dict[str, int] = {}
+        for case, data in proposed.values():
+            totals[case] = totals.get(case, 0) + len(data)
+        require(all(size <= self.limits.case for size in totals.values()))
+        require(sum(totals.values()) <= self.limits.cycle)
+        # A single replacement follows all validation: denial mutates no balance.
+        self._artifacts = proposed
+
+    def preview(self, case: str, size: int, artifact: bool = True) -> None:
+        """Capacity question only; no allocation or pretend reservation."""
+        require(case in self.allowed and type(size) is int and size >= 0)
         require(not artifact or size <= self.limits.artifact)
-        next_case = self.cases.get(case, 0) + size
-        require(next_case <= self.limits.case and self.total + size <= self.limits.cycle)
-        self.cases[case] = next_case
-        self.total += size
+        require(self.cases.get(case, 0) + size <= self.limits.case)
+        require(self.total + size <= self.limits.cycle)
+
+    def preview_cycle(self, size: int) -> None:
+        require(type(size) is int and size >= 0 and self.total + size <= self.limits.cycle)
+
+    def write_owned(self, key: str, case: str, data: bytes, target: pathlib.Path) -> None:
+        require(not target.exists() and not target.is_symlink())
+        self.put_many({key: (case, data)})
+        # Reservation remains conservatively charged on I/O failure; stop rather
+        # than pretending a rollback erased partially written evidence.
+        with target.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def inventory(self) -> list[dict[str, object]]:
+        return [{"artifact": key, "case": case, "bytes": len(data), "sha256": digest(data)}
+                for key, (case, data) in sorted(self._artifacts.items())]
+
+
+class ModelInterrupted(Exception):
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__("interrupted")
+
+
+class Journal:
+    """Immutable bounded attempt/result receipts, including partial failure."""
+    def __init__(self, budget: Budget, root: pathlib.Path, candidate: str, fixture: str):
+        self.budget, self.root = budget, root
+        self.candidate, self.fixture = candidate, fixture
+        self.planned, self.attempted, self.matched, self.failed = 674, 0, 0, 0
+        self.current: dict[str, object] | None = None
+        self.receipt_serial = 0
+        self.emit({"kind": "header", "observed": "PREPARING"})
+
+    def counts(self) -> dict[str, int]:
+        return {"planned": self.planned, "attempted": self.attempted,
+                "pass": self.matched, "fail": self.failed,
+                "not_executed": self.planned - self.attempted,
+                "incomplete": self.attempted - self.matched - self.failed}
+
+    def emit(self, event: dict[str, object]) -> None:
+        self.receipt_serial += 1
+        record = {"schema": "artificial-receipt-v2", "candidate": self.candidate,
+                  "fixture_sha256": self.fixture, "count_scope": "logical-model-only-not-native-acceptance",
+                  "counts": self.counts(), **event}
+        name = "condition-" + str(self.receipt_serial).zfill(5) + ".json"
+        self.budget.write_owned("evidence/" + name, "cycle-evidence", encoded(record),
+                                self.root / "evidence" / name)
+
+    def begin(self, group: str, identifier: str, refused: bool) -> None:
+        require(self.current is None and self.attempted < self.planned)
+        self.attempted += 1
+        self.current = {"group": group, "condition": identifier,
+                        "expected": "deny" if refused else "allow"}
+        self.emit({"kind": "attempt", "observed": "STARTED", **self.current})
+
+    def finish(self, matched: bool, error: BaseException | None = None) -> None:
+        require(self.current is not None)
+        event = dict(self.current)
+        if matched:
+            self.matched += 1
+        else:
+            self.failed += 1
+        self.current = None
+        self.emit({"kind": "result", "observed": "MATCHED_MODEL" if matched else "FAILED_MODEL",
+                   "error_type": type(error).__name__ if error else None, **event})
+
+    def failure(self, error: BaseException) -> None:
+        if self.current is not None:
+            self.finish(False, error)
+        self.emit({"kind": "termination", "observed": "ERROR_OR_INTERRUPT",
+                   "error_type": type(error).__name__, "evidence_after_host_loss": "NOT_PROVEN"})
 
 
 @dataclass(frozen=True)
@@ -158,58 +273,75 @@ class Policy:
 
 
 class Store:
-    """Authorizes before resolving contents, including counts and indirect surfaces."""
-    def __init__(self, policy: Policy):
-        self.policy = policy
-        self.records = {(case, surface): b"ARTIFICIAL-" + case.encode()
+    """Policy and one shared artifact ledger precede every content mutation."""
+    def __init__(self, policy: Policy, budget: Budget, fixture: dict[str, str]):
+        self.policy, self.budget = policy, budget
+        require(set(fixture) == set(policy.versions))
+        self.records = {(case, surface): "store/" + case + "/" + surface
                         for case in policy.versions
                         for surface in ("objects", "metadata", "logs", "indexes", "keys", "backups")}
+        budget.put_many({key: (case, fixture[case].encode())
+                         for (case, _), key in self.records.items()})
 
     def request(self, grant: Grant | None, subject: str, case: str, operation: str,
                 surface: str) -> object:
         self.policy.check(grant, subject, case, operation, surface)
         require((case, surface) in self.records)
-        value = self.records[case, surface]
+        key = self.records[case, surface]
+        value = self.budget.read(key)
         if operation == "count":
             return 1
         if operation in ("list", "search"):
             return (case,)
         if operation == "edit":
-            self.records[case, surface] = value + b"-EDITED"
+            self.budget.put_many({key: (case, value + b"-EDITED")})
             return "edited"
         return value
 
 
 class Receiver:
-    """In-process bounded receiver; no sockets and no claim of network enforcement."""
-    def __init__(self, clock: Clock, limits: Limits):
-        self.clock, self.limits = clock, limits
+    """Logical rolling-one-second limit; no socket or wall-time guarantee."""
+    def __init__(self, clock: Clock, limits: Limits, budget: Budget, namespace: str):
+        self.clock, self.limits, self.budget, self.namespace = clock, limits, budget, namespace
         self.active: set[str] = set()
-        self.jobs: dict[str, int] = {}
-        self.window_start = clock.now
-        self.window_bytes = 0
-        self.receipts: list[dict[str, object]] = []
+        self.bindings: dict[str, str] = {}
+        self.job_keys: dict[str, str] = {}
+        self.recent: list[tuple[float, int]] = []
+        self.last_accept = clock.now
+        self.receipt_key = namespace + "/receipts"
 
-    def connect(self, identifier: str, destination: str = "local-artificial") -> None:
-        require(destination == "local-artificial")
+    @property
+    def receipts(self) -> list[dict[str, object]]:
+        if self.receipt_key not in self.budget._artifacts:
+            return []
+        return json.loads(self.budget.read(self.receipt_key))
+
+    def connect(self, identifier: str, destination: str = "local-artificial", case: str = "red-a") -> None:
+        require(destination == "local-artificial" and case in self.budget.allowed and case != "cycle-evidence")
         require(identifier not in self.active and len(self.active) < self.limits.connections)
         self.active.add(identifier)
+        self.bindings[identifier] = case
 
     def disconnect(self, identifier: str) -> None:
         self.active.discard(identifier)
+        self.bindings.pop(identifier, None)
 
     def accept(self, identifier: str, job: str, block: bytes) -> None:
         require(identifier in self.active and isinstance(block, bytes))
-        require(len(block) <= self.limits.block)
-        total = self.jobs.get(job, 0) + len(block)
-        require(total <= self.limits.receiver_bytes)
-        if self.clock.now - self.window_start >= 1.0:
-            self.window_start, self.window_bytes = self.clock.now, 0
-        require(self.window_bytes + len(block) <= self.limits.rate)
-        self.jobs[job] = total
-        self.window_bytes += len(block)
-        self.receipts.append({"job": job, "bytes": len(block), "sha256": digest(block),
-                              "logical_time": self.clock.now})
+        require(len(block) <= self.limits.block and self.clock.now >= self.last_accept)
+        case = self.bindings[identifier]
+        key = self.job_keys.get(job, self.namespace + "/job/" + job)
+        previous = self.budget.read(key) if key in self.budget._artifacts else b""
+        require(len(previous) + len(block) <= self.limits.receiver_bytes)
+        recent = [(stamp, size) for stamp, size in self.recent if self.clock.now - stamp < 1.0]
+        require(sum(size for _, size in recent) + len(block) <= self.limits.rate)
+        receipts = self.receipts + [{"job": job, "case": case, "bytes": len(block),
+                                     "sha256": digest(block), "logical_time": self.clock.now}]
+        self.budget.put_many({key: (case, previous + block),
+                              self.receipt_key: ("cycle-evidence", encoded(receipts))})
+        self.job_keys[job] = key
+        self.recent = recent + [(self.clock.now, len(block))]
+        self.last_accept = self.clock.now
 
 
 @dataclass(frozen=True)
@@ -260,17 +392,24 @@ class Activity:
 
 
 class Quarantine:
-    def __init__(self):
-        self.original = encoded({"classification": "ARTIFICIAL", "items": [
+    def __init__(self, budget: Budget):
+        self.budget = budget
+        original = encoded({"classification": "ARTIFICIAL", "items": [
             {"id": "item-a", "category": "approved", "text": "artificial-alpha"},
             {"id": "item-b", "category": "third-party", "text": "artificial-beta"},
             {"id": "item-c", "category": "attachment", "text": "artificial-gamma"},
             {"id": "item-d", "category": "out-of-scope", "text": "artificial-delta"},
             {"id": "item-e", "category": "deleted-marker", "text": "artificial-epsilon"}]})
-        self.original_hash = digest(self.original)
-        self.working_copy = bytes(bytearray(self.original))
-        self.version = 1
-        self.allowed = {"approved"}
+        budget.put_many({"incidental/source": ("red-a", original), "incidental/copy": ("red-a", bytes(bytearray(original)))})
+        self.original_hash, self.version, self.allowed = digest(original), 1, {"approved"}
+
+    @property
+    def original(self) -> bytes:
+        return self.budget.read("incidental/source")
+
+    @property
+    def working_copy(self) -> bytes:
+        return self.budget.read("incidental/copy")
 
     def triage(self, actor: str) -> tuple[str, ...]:
         require(actor == "actor-triage")
@@ -278,42 +417,53 @@ class Quarantine:
 
     def derive(self, actor: str) -> bytes:
         require(actor == "actor-triage")
-        return encoded([item for item in json.loads(self.working_copy)["items"]
-                        if item["category"] in self.allowed])
+        data = encoded([item for item in json.loads(self.working_copy)["items"] if item["category"] in self.allowed])
+        self.budget.put_many({"incidental/derived": ("red-a", data)})
+        return self.budget.read("incidental/derived")
 
     def expand(self, category: str, approver: str, version: int) -> None:
         require(approver == "actor-approve" and version == self.version + 1)
-        self.version = version
-        self.allowed.add(category)
+        self.version, self.allowed = version, self.allowed | {category}
 
 
 class Lifecycle:
-    def __init__(self, clock: Clock):
-        self.clock = clock
-        self.live = {"red-a": b"artificial-a", "blue-a": b"artificial-b"}
-        self.backup = copy.deepcopy(self.live)
-        self.holds = {"red-a"}
-        self.tombstones: set[str] = set()
-        self.revoked: set[str] = set()
+    def __init__(self, clock: Clock, budget: Budget):
+        self.clock, self.budget = clock, budget
+        self.live_ids = {case: "lifecycle/live/" + case for case in ("red-a", "blue-a")}
+        self.backup_ids = {case: "lifecycle/backup/" + case for case in self.live_ids}
+        changes = {key: (case, b"artificial-" + case.encode()) for case, key in self.live_ids.items()}
+        changes.update({key: (case, bytes(bytearray(changes[self.live_ids[case]][1]))) for case, key in self.backup_ids.items()})
+        budget.put_many(changes)
+        self.holds, self.tombstones, self.revoked = {"red-a"}, set(), set()
+        self.staging_ids: set[str] = set()
+
+    @property
+    def live(self) -> dict[str, bytes]:
+        return {case: self.budget.read(key) for case, key in self.live_ids.items()}
 
     def discard(self, case: str) -> None:
-        require(self.clock.now >= 60 and case not in self.holds)
-        require(case in self.live)
+        require(self.clock.now >= 60 and case not in self.holds and case in self.live_ids)
+        self.budget.put_many({self.live_ids[case]: None})
         self.tombstones.add(case)
-        del self.live[case]
+        del self.live_ids[case]
 
     def release(self, case: str, actor: str) -> None:
         require(actor == "actor-approve" and self.clock.now >= 90)
         self.holds.discard(case)
 
     def restore(self) -> dict[str, bytes]:
-        # New staging only, never overwrite live state or any filesystem backup.
-        return {case: value for case, value in self.backup.items()
-                if case not in self.tombstones and case not in self.revoked}
+        staging = {case: self.budget.read(key) for case, key in self.backup_ids.items()
+                   if case not in self.tombstones and case not in self.revoked}
+        changes = {key: None for key in self.staging_ids}
+        changes.update({"lifecycle/staging/" + case: (case, data) for case, data in staging.items()})
+        self.budget.put_many(changes)
+        self.staging_ids = {"lifecycle/staging/" + case for case in staging}
+        return staging
 
 
 class ArtificialKeys:
-    def __init__(self):
+    def __init__(self, budget: Budget):
+        self.budget = budget
         self.generations = {"red-a": 1, "blue-a": 1}
 
     @staticmethod
@@ -324,14 +474,18 @@ class ArtificialKeys:
     def rotate(self, case: str, requester: str, approvals: tuple[str, ...]) -> str:
         self.authorize(requester, approvals)
         require(case in self.generations)
-        self.generations[case] += 1
-        # Public artificial fingerprint, not an encryption key or recovery service.
-        return digest(encoded(["ARTIFICIAL", case, self.generations[case]]))
+        generation = self.generations[case] + 1
+        fingerprint = digest(encoded(["ARTIFICIAL", case, generation]))
+        self.budget.put_many({"keys/" + case: (case, fingerprint.encode())})
+        self.generations[case] = generation
+        return fingerprint
 
     def recover(self, case: str, requester: str, approvals: tuple[str, ...]) -> str:
         self.authorize(requester, approvals)
         require(case in self.generations)
-        return digest(encoded(["ARTIFICIAL", case, self.generations[case]]))
+        fingerprint = digest(encoded(["ARTIFICIAL", case, self.generations[case]]))
+        self.budget.put_many({"key-recovery/" + case: (case, fingerprint.encode())})
+        return fingerprint
 
     def emergency(self, requester: str, approvals: tuple[str, ...]) -> str:
         self.authorize(requester, approvals)
@@ -339,31 +493,44 @@ class ArtificialKeys:
 
 
 class Suite:
-    def __init__(self, limits: Limits):
-        self.limits = limits
+    def __init__(self, limits: Limits, budget: Budget, journal: Journal, fixture: dict[str, str]):
+        self.limits, self.budget, self.journal, self.fixture = limits, budget, journal, fixture
+        self.receiver_serial = 0
         self.events: list[dict[str, object]] = []
         self.identifiers: set[str] = set()
         self.chains: list[dict[str, object]] = []
+
+    def new_receiver(self, clock: Clock) -> Receiver:
+        self.receiver_serial += 1
+        return Receiver(clock, self.limits, self.budget, "receiver-" + str(self.receiver_serial))
 
     def observe(self, group: str, identifier: str, operation: Callable[[], object],
                 refused: bool = False, predicate: Callable[[object], bool] | None = None) -> None:
         require(identifier not in self.identifiers)
         self.identifiers.add(identifier)
+        self.journal.begin(group, identifier, refused)
         try:
-            result = operation()
-        except Denied as error:
-            if not refused or str(error) != "denied":
-                raise RuntimeError("unexpected artificial refusal") from error
-        else:
-            if refused or (predicate is not None and not predicate(result)):
-                raise RuntimeError("artificial expectation contradicted")
+            try:
+                result = operation()
+            except Denied as error:
+                if not refused or str(error) != "denied":
+                    raise RuntimeError("unexpected artificial refusal") from error
+            else:
+                if refused or (predicate is not None and not predicate(result)):
+                    raise RuntimeError("artificial expectation contradicted")
+        except BaseException as original:
+            try:
+                self.journal.finish(False, original)
+            except BaseException as evidence_error:
+                print("evidence_error=" + type(evidence_error).__name__, file=sys.stderr)
+            raise
         self.events.append({"group": group, "id": identifier,
-                            "expectation": "deny" if refused else "allow",
-                            "outcome": "MODEL_CONDITION_MATCHED"})
+                            "expectation": "deny" if refused else "allow", "outcome": "MODEL_CONDITION_MATCHED"})
+        self.journal.finish(True)
 
     def isolation(self) -> None:
         policy = Policy(Clock(), self.limits)
-        store = Store(policy)
+        store = Store(policy, self.budget, self.fixture)
         for origin in policy.versions:
             grant = policy.issue(origin)
             for target in policy.versions:
@@ -404,7 +571,7 @@ class Suite:
         phases = ("before-queue", "queue", "start", "active", "read-block", "prepared-export", "active-export")
         for phase in phases:
             clock, limits = Clock(), self.limits
-            policy, receiver = Policy(clock, limits), Receiver(clock, limits)
+            policy, receiver = Policy(clock, limits), self.new_receiver(clock)
             grant = policy.issue("red-a")
             activity = Activity(policy, grant, receiver)
             receiver.connect("activity")
@@ -416,13 +583,13 @@ class Suite:
                          predicate=lambda x: x == ("stopped", set()))
         clock, limits = Clock(), self.limits
         policy = Policy(clock, limits)
-        receiver = Receiver(clock, limits)
+        receiver = self.new_receiver(clock)
         activity = Activity(policy, policy.issue("red-a"), receiver)
         clock.advance(1.01)
         self.observe("revocation", "stale-recheck", lambda: activity.move("start"), True)
 
     def incidental(self) -> None:
-        quarantine = Quarantine()
+        quarantine = Quarantine(self.budget)
         original = quarantine.original
         self.observe("incidental", "unauthorized-triage", lambda: quarantine.triage("actor-admin"), True)
         self.observe("incidental", "minimal-triage", lambda: quarantine.triage("actor-triage"),
@@ -447,7 +614,7 @@ class Suite:
 
     def lifecycle(self) -> None:
         clock = Clock()
-        lifecycle = Lifecycle(clock)
+        lifecycle = Lifecycle(clock, self.budget)
         other = lifecycle.live["blue-a"]
         clock.advance(60)
         self.observe("lifecycle", "hold-denies-discard", lambda: lifecycle.discard("red-a"), True)
@@ -465,7 +632,7 @@ class Suite:
 
     def destinations_and_quotas(self) -> None:
         limits, clock = self.limits, Clock()
-        receiver = Receiver(clock, limits)
+        receiver = self.new_receiver(clock)
         for destination in ("ipv4-simulated", "ipv6-simulated", "dns-simulated", "proxy-simulated",
                             "redirect-simulated", "metadata-simulated"):
             self.observe("destinations", destination,
@@ -484,17 +651,15 @@ class Suite:
             receiver.accept("c0", "job-a", block)
         clock.advance(1)
         self.observe("quotas", "job-byte-exceeded", lambda: receiver.accept("c0", "job-a", b"a"), True)
-        budget = Budget(limits)
-        self.observe("quotas", "artifact-positive", lambda: budget.reserve("red-a", limits.artifact))
-        self.observe("quotas", "artifact-exceeded", lambda: budget.reserve("red-a", limits.artifact + 1), True)
-        self.observe("quotas", "case-exceeded", lambda: budget.reserve("red-a", limits.case, False), True)
-        for case in ("red-a", "red-b", "blue-a", "blue-b"):
-            budget.reserve(case, limits.case - budget.cases.get(case, 0), False)
-        self.observe("quotas", "cycle-exceeded", lambda: budget.reserve("extra-case", 1), True)
+        budget = self.budget
+        self.observe("quotas", "artifact-positive", lambda: budget.preview("red-a", limits.artifact))
+        self.observe("quotas", "artifact-exceeded", lambda: budget.preview("red-a", limits.artifact + 1), True)
+        self.observe("quotas", "case-exceeded", lambda: budget.preview("red-a", limits.case + 1, False), True)
+        self.observe("quotas", "cycle-exceeded", lambda: budget.preview_cycle(limits.cycle + 1), True)
 
     def export_and_keys(self) -> None:
         clock, limits = Clock(), self.limits
-        policy, receiver = Policy(clock, limits), Receiver(clock, limits)
+        policy, receiver = Policy(clock, limits), self.new_receiver(clock)
         grant = policy.issue("red-a")
         receiver.connect("export-connection")
         delivery = Delivery(policy, receiver)
@@ -515,7 +680,7 @@ class Suite:
                      lambda: delivery.send(renewed, "receiver-artificial", "approved-derived", b"a"), True)
         self.observe("export", "receipt", lambda: receiver.receipts,
                      predicate=lambda x: len(x) == 1 and x[0]["bytes"] == len(b"ARTIFICIAL"))
-        keys = ArtificialKeys()
+        keys = ArtificialKeys(self.budget)
         for operation in ("rotate", "recover"):
             method = getattr(keys, operation)
             self.observe("keys", operation + "/single",
@@ -537,6 +702,8 @@ class Suite:
         original = b"ARTIFICIAL ORIGINAL: selected=alpha; excluded=beta"
         working = bytes(bytearray(original))
         derived = b"ARTIFICIAL DERIVED: selected=alpha"
+        self.budget.put_many({"provenance/source": ("red-a", original),
+                              "provenance/copy": ("red-a", working), "provenance/derived": ("red-a", derived)})
         chain = []
         parent = None
         for stage, content in (("original", original), ("copy", working), ("derived", derived)):
@@ -559,9 +726,13 @@ class Suite:
             scenario()
         groups = {event["group"] for event in self.events}
         require(len(groups) == 10 and len(self.events) == 674)
-        return {"schema": "artificial-controls-v1", "scope": "host-side-logical-model",
+        return self.report()
+
+    def report(self) -> dict[str, object]:
+        return {"schema": "artificial-controls-v2", "scope": "host-side-logical-model",
                 "clock": "logical-not-wall-time", "conditions": self.events,
-                "planned_conditions": 674, "condition_count": len(self.events), "failed": 0,
+                "planned_conditions": 674, "condition_count": len(self.events), "counts": self.journal.counts(),
+                "budget_inventory_before_final_report": self.budget.inventory(),
                 "chains": self.chains,
                 "FACT": "Only local artificial model conditions are represented",
                 "INFERENCE": "Model agreement cannot establish kernel or product security",
@@ -571,29 +742,61 @@ class Suite:
 
 
 def main() -> int:
-    # Workflow is the sole intended entry; these checks are not a security boundary.
+    # These context checks are not a security boundary or operational authority.
     require(os.environ.get("GITHUB_ACTIONS") == "true")
     require(os.environ.get("MODEL_DRIVER_ALLOWED") == "manual-locked-candidate")
     require(os.environ.get("CANDIDATE_SHA_INPUT") == os.environ.get("GITHUB_SHA"))
-    require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch")
-    require(len(sys.argv) == 2)
+    require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and len(sys.argv) == 2)
     root = pathlib.Path(sys.argv[1])
     expected = pathlib.Path(os.environ["RUNNER_TEMP"]) / os.environ["OWNED_PREFIX"]
     require(root == expected and not root.is_symlink() and root.is_dir())
     require((root / "evidence").is_dir() and not (root / "evidence").is_symlink())
     require(re.fullmatch(r"synthetic-[0-9]+-[0-9]+", root.name) is not None)
-    start = time.monotonic()
     limits = Limits.configured()
-    report = Suite(limits).run()
-    report["real_model_seconds"] = time.monotonic() - start
-    report["candidate"] = os.environ["GITHUB_SHA"]
-    data = encoded(report)
     budget = Budget(limits)
-    budget.reserve("model-report", len(data))
-    target = root / "evidence" / "artificial-controls.json"
-    require(not target.exists() and not target.is_symlink())
-    with target.open("xb") as stream:
-        stream.write(data)
+    fixture = {case: "ARTIFICIAL-" + case for case in ("red-a", "red-b", "blue-a", "blue-b")}
+    fixture_bytes = encoded({"classification": "ARTIFICIAL", "cases": fixture})
+    fixture_hash = digest(fixture_bytes)
+    journal = Journal(budget, root, os.environ["GITHUB_SHA"], fixture_hash)
+    suite = None
+    original: BaseException | None = None
+    evidence_error: BaseException | None = None
+    started = time.monotonic()
+    previous_handlers = {}
+    def interrupted(signum: int, frame: object) -> None:
+        raise ModelInterrupted(signum)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, interrupted)
+    try:
+        budget.write_owned("fixtures/package", "cycle-evidence", fixture_bytes, root / "fixtures" / "fixtures.json")
+        budget.write_owned("evidence/fixture-sha256", "cycle-evidence",
+                           (fixture_hash + "  ../fixtures/fixtures.json\n").encode(), root / "evidence" / "fixture.sha256")
+        suite = Suite(limits, budget, journal, fixture)
+        suite.run()
+    except BaseException as error:
+        original = error
+    finally:
+        try:
+            if original is not None:
+                journal.failure(original)
+            report = suite.report() if suite is not None else {"counts": journal.counts(), "conditions": []}
+            report.update({"candidate": os.environ["GITHUB_SHA"], "fixture_sha256": fixture_hash,
+                           "status": "ERROR_OR_INTERRUPT" if original else "MODEL_COMPLETE",
+                           "original_error_type": type(original).__name__ if original else None,
+                           "real_model_seconds": time.monotonic() - started,
+                           "operational_readiness": "BLOCKED", "evidence_after_host_loss": "NOT_PROVEN"})
+            budget.write_owned("evidence/final-report", "cycle-evidence", encoded(report),
+                               root / "evidence" / "artificial-controls.json")
+        except BaseException as error:
+            evidence_error = error
+            print("evidence_loss=" + type(error).__name__, file=sys.stderr)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+    if original is not None:
+        raise original
+    if evidence_error is not None:
+        raise evidence_error
     print("artificial_model_recorded=true; operational_readiness=BLOCKED")
     return 0
 
@@ -601,5 +804,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except ModelInterrupted as error:
+        raise SystemExit(128 + error.signum)
     except Denied:
-        raise SystemExit("artificial model admission refused")
+        raise SystemExit("artificial model refused; inspect owned evidence")

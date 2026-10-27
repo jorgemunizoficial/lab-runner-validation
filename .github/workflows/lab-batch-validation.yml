@@ -43,7 +43,7 @@ jobs:
       MAX_CLEANUP_SECONDS: "120"
       CANDIDATE_SHA_INPUT: ${{ inputs.candidate_sha }}
       EXECUTION_ORDER_INPUT: ${{ inputs.execution_order }}
-      MODEL_SOURCE_SHA256: 675a97245692bc7b1e3a4ee28d62482a9a1443554472750a51636fdc9d30237e
+      MODEL_SOURCE_SHA256: ccc303669767239c1a2055c3ad2aaad728461b0d3f8f77d1a11cbfcd1e34ce02
 
     steps:
       - name: Admission guard
@@ -69,11 +69,12 @@ jobs:
           mkdir -m 700 "$ROOT"
           mkdir -m 700 "$ROOT/evidence" "$ROOT/fixtures" "$ROOT/state"
           printf '%s\n' "$PREFIX" > "$ROOT/state/prefix"
-          mkdir -m 700 "$ROOT/state/ledger"
+          mkdir -m 700 "$ROOT/state/ledger" "$ROOT/state/intents"
           python3 - <<'PY'
-          import os, pathlib, time
+          import os, pathlib, time, json
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/('synthetic-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
           (root/'state'/'cycle-start').write_text(str(time.monotonic()), encoding='utf-8')
+          (root/'state'/'phase.json').write_text(json.dumps({'phase':'work','cleanup_started':None}),encoding='utf-8')
           PY
           printf 'ROOT=%s\n' "$ROOT" >> "$GITHUB_ENV"
           printf 'OWNED_PREFIX=%s\n' "$PREFIX" >> "$GITHUB_ENV"
@@ -88,107 +89,183 @@ jobs:
             test ! -L "$ROOT" && test -d "$ROOT/state" || return 1
             test "$(cat "$ROOT/state/prefix")" = "$OWNED_PREFIX"
           }
-          # Calls reserve the cleanup window. The host remains a shared failure domain.
+          # The persisted phase is monotonic. Cleanup, inventory and seal share one window.
+          phase_name() {
+            python3 -c 'import json,os,pathlib; print(json.loads((pathlib.Path(os.environ["ROOT"])/"state"/"phase.json").read_text())["phase"])'
+          }
+          require_work_phase() { test "$(phase_name)" = work; }
+          enter_cleanup() {
+            python3 - <<'PY'
+          import json,os,pathlib,time
+          root=pathlib.Path(os.environ['ROOT']); path=root/'state'/'phase.json'
+          state=json.loads(path.read_text())
+          if state['phase']=='cleanup':
+              if not isinstance(state['cleanup_started'],(int,float)): raise SystemExit('invalid cleanup clock')
+          elif state['phase']=='work':
+              state={'phase':'cleanup','cleanup_started':time.monotonic()}
+              temp=root/'state'/('.phase-'+os.urandom(8).hex())
+              with temp.open('xb') as f:
+                  f.write(json.dumps(state).encode());f.flush();os.fsync(f.fileno())
+              temp.replace(path)
+              fd=os.open(root/'state',os.O_RDONLY|os.O_DIRECTORY)
+              try: os.fsync(fd)
+              finally: os.close(fd)
+          else: raise SystemExit('invalid cycle phase')
+          PY
+          }
           deadline_seconds() {
-            CONTROL_PHASE="${CONTROL_PHASE:-work}" DC_SECONDS="${DC_SECONDS:-5}" CLEANUP_DEADLINE_MS="${CLEANUP_DEADLINE_MS:-0}" python3 - <<'PY'
-          import os,pathlib,time
-          root=pathlib.Path(os.environ['ROOT'])
-          now=time.monotonic()
-          start=float((root/'state'/'cycle-start').read_text())
+            DC_SECONDS="${DC_SECONDS:-5}" python3 - <<'PY'
+          import json,os,pathlib,time
+          root=pathlib.Path(os.environ['ROOT']); now=time.monotonic()
+          start=float((root/'state'/'cycle-start').read_text()); state=json.loads((root/'state'/'phase.json').read_text())
           end=start+int(os.environ['MAX_CYCLE_SECONDS'])
-          if os.environ['CONTROL_PHASE']!='cleanup': end-=int(os.environ['MAX_CLEANUP_SECONDS'])
-          cleanup=int(os.environ['CLEANUP_DEADLINE_MS'])/1000
-          if cleanup: end=min(end,cleanup)
+          if state['phase']=='work': end-=int(os.environ['MAX_CLEANUP_SECONDS'])
+          elif state['phase']=='cleanup': end=min(end,float(state['cleanup_started'])+int(os.environ['MAX_CLEANUP_SECONDS']))
+          else: raise SystemExit('invalid cycle phase')
           remaining=end-now-1.0
           if remaining<=0: raise SystemExit('deadline admission refused')
           print(min(float(os.environ['DC_SECONDS']),remaining))
           PY
           }
           dc() {
-            local seconds
+            local seconds phase
+            phase=$(phase_name) || return 1
+            if test "$phase" = cleanup; then
+              case "$1" in ps|inspect|rm|kill|wait) ;; *) echo 'work admission closed'; return 1 ;; esac
+            elif test "$phase" != work; then return 1; fi
             seconds=$(deadline_seconds) || return 1
             timeout --signal=TERM --kill-after=1s "${seconds}s" docker "$@"
           }
+          create_intent() {
+            require_work_phase || return 1
+            CREATED_NAME="$1" python3 - <<'PY'
+          import hashlib,json,os,pathlib,time
+          root=pathlib.Path(os.environ['ROOT']); name=os.environ['CREATED_NAME']
+          if name not in (os.environ['OWNED_PREFIX']+'-worker',os.environ['OWNED_PREFIX']+'-peer'):
+              raise SystemExit('invalid owned name')
+          token=os.urandom(16).hex()
+          data={'intent':token,'name':name,'cycle':os.environ['OWNED_PREFIX'],'candidate':os.environ['GITHUB_SHA'],
+                'owner':'public-synthetic-executor','created_monotonic':time.monotonic()}
+          target=root/'state'/'intents'/(token+'.json')
+          with target.open('xb') as f:
+              f.write(json.dumps(data,sort_keys=True,separators=(',',':')).encode());f.flush();os.fsync(f.fileno())
+          target.chmod(0o400)
+          fd=os.open(target.parent,os.O_RDONLY|os.O_DIRECTORY)
+          try: os.fsync(fd)
+          finally: os.close(fd)
+          print(token)
+          PY
+          }
           record_owned() {
-            CREATED_ID="$1" CREATED_NAME="$2" python3 - <<'PY'
-          import json,os,pathlib,re,time
-          root=pathlib.Path(os.environ['ROOT']); identifier=os.environ['CREATED_ID']
-          if not re.fullmatch('[0-9a-f]{64}',identifier): raise SystemExit('invalid resource identity')
+            CREATED_ID="$1" CREATED_NAME="$2" CREATED_INTENT="$3" python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,time
+          root=pathlib.Path(os.environ['ROOT']); identifier=os.environ['CREATED_ID']; token=os.environ['CREATED_INTENT']
+          if not re.fullmatch('[0-9a-f]{64}',identifier) or not re.fullmatch('[0-9a-f]{32}',token):
+              raise SystemExit('invalid identity')
           before={line.split()[0] for line in (root/'evidence'/'docker-before.txt').read_text().splitlines()}
           if identifier in before: raise SystemExit('pre-existing identity refused')
-          receipt={'id':identifier,'cycle':os.environ['OWNED_PREFIX'],'candidate':os.environ['GITHUB_SHA'],
-                   'name':os.environ['CREATED_NAME'],'created_monotonic':time.monotonic(),'owner':'public-synthetic-executor'}
-          target=root/'state'/'ledger'/(identifier+'.json')
-          with target.open('xb') as f:
+          intent_path=root/'state'/'intents'/(token+'.json')
+          if intent_path.is_symlink(): raise SystemExit('symlink intent refused')
+          raw=intent_path.read_bytes(); intent=json.loads(raw)
+          if intent['candidate']!=os.environ['GITHUB_SHA'] or intent['cycle']!=os.environ['OWNED_PREFIX'] or intent['name']!=os.environ['CREATED_NAME'] or intent['intent']!=token or intent['owner']!='public-synthetic-executor':
+              raise SystemExit('intent mismatch')
+          receipt={'id':identifier,'intent':token,'intent_sha256':hashlib.sha256(raw).hexdigest(),
+                   'cycle':os.environ['OWNED_PREFIX'],'candidate':os.environ['GITHUB_SHA'],'name':os.environ['CREATED_NAME'],
+                   'created_monotonic':time.monotonic(),'owner':'public-synthetic-executor'}
+          folder=root/'state'/'ledger'; target=folder/(identifier+'.json')
+          temp=folder/('.pending-'+identifier+'-'+os.urandom(8).hex())
+          with temp.open('xb') as f:
               f.write(json.dumps(receipt,sort_keys=True,separators=(',',':')).encode());f.flush();os.fsync(f.fileno())
-          target.chmod(0o400)
+          temp.chmod(0o400)
+          # Exclusive hard-link publication is atomic and refuses an existing target.
+          os.link(temp,target,follow_symlinks=False)
+          fd=os.open(folder,os.O_RDONLY|os.O_DIRECTORY)
+          try:
+              os.fsync(fd);temp.unlink();os.fsync(fd)
+          finally: os.close(fd)
           PY
+          }
+          cleanup_event() {
+            test -n "$1" || return 1
+            printf '{"resource":"%s","status":"%s"}\n' "$2" "$3" >> "$1"
           }
           owned_rm() {
             check_root || return 1
-            local started now id ids owner candidate failed=0 CONTROL_PHASE=cleanup CLEANUP_DEADLINE_MS
-            started=$(clock_ms) || return 1
-            CLEANUP_DEADLINE_MS=$((started+MAX_CLEANUP_SECONDS*1000))
-            ids=$(python3 - <<'PY'
-          import json,os,pathlib,re
-          root=pathlib.Path(os.environ['ROOT'])
-          for receipt in sorted((root/'state'/'ledger').iterdir()):
-              if receipt.is_symlink() or not receipt.is_file(): raise SystemExit('invalid ledger entry')
-              data=json.loads(receipt.read_bytes())
-              identifier=data['id']
-              if not re.fullmatch('[0-9a-f]{64}',identifier): raise SystemExit('invalid identity')
-              if receipt.name!=identifier+'.json' or data['cycle']!=os.environ['OWNED_PREFIX']:
-                  raise SystemExit('ledger mismatch')
-              if data['candidate']!=os.environ['GITHUB_SHA'] or data['owner']!='public-synthetic-executor':
-                  raise SystemExit('ownership mismatch')
-              print(identifier)
+            enter_cleanup || return 1
+            local selection ids errors id inventory owner candidate failed=0 report
+            selection=$(python3 - <<'PY'
+          import hashlib,json,os,pathlib,re
+          root=pathlib.Path(os.environ['ROOT']); errors=[]; candidates=[]; intents={}
+          def bad(path,reason):
+              errors.append({'entry_hash':hashlib.sha256(path.name.encode()).hexdigest(),'reason':reason})
+          for path in sorted((root/'state'/'intents').iterdir()):
+              try:
+                  if path.is_symlink() or not path.is_file() or not re.fullmatch(r'[0-9a-f]{32}\.json',path.name):
+                      raise ValueError('invalid intent entry')
+                  raw=path.read_bytes(); data=json.loads(raw)
+                  if data['intent']+'.json'!=path.name or data['cycle']!=os.environ['OWNED_PREFIX'] or data['candidate']!=os.environ['GITHUB_SHA'] or data['owner']!='public-synthetic-executor':
+                      raise ValueError('intent ownership mismatch')
+                  intents[data['intent']]=(data,hashlib.sha256(raw).hexdigest())
+              except Exception as error: bad(path,type(error).__name__)
+          before={line.split()[0] for line in (root/'evidence'/'docker-before.txt').read_text().splitlines()}
+          for path in sorted((root/'state'/'ledger').iterdir()):
+              try:
+                  if path.is_symlink() or not path.is_file(): raise ValueError('invalid receipt entry')
+                  data=json.loads(path.read_bytes()); identifier=data['id']; token=data['intent']
+                  if not re.fullmatch('[0-9a-f]{64}',identifier) or path.name!=identifier+'.json' or identifier in before:
+                      raise ValueError('invalid receipt identity')
+                  if data['cycle']!=os.environ['OWNED_PREFIX'] or data['candidate']!=os.environ['GITHUB_SHA'] or data['owner']!='public-synthetic-executor':
+                      raise ValueError('receipt ownership mismatch')
+                  intent,expected=intents[token]
+                  if data['intent_sha256']!=expected or data['name']!=intent['name']: raise ValueError('intent proof mismatch')
+                  candidates.append(data)
+              except Exception as error: bad(path,type(error).__name__)
+          counts={token:sum(row['intent']==token for row in candidates) for token in intents}
+          valid=[]
+          for row in candidates:
+              if counts[row['intent']]!=1: errors.append({'resource':row['id'],'reason':'ambiguous intent'})
+              else: valid.append(row['id'])
+          for token in intents:
+              if counts[token]==0: errors.append({'intent':token,'reason':'unresolved create intent'})
+          print(json.dumps({'candidate':os.environ['GITHUB_SHA'],'cycle':os.environ['OWNED_PREFIX'],
+                            'valid_ids':valid,'errors':errors,'unknown_resources_preserved':True},sort_keys=True))
           PY
             ) || return 1
+            ids=$(SELECTION="$selection" python3 -c 'import json,os; print(" ".join(json.loads(os.environ["SELECTION"])["valid_ids"]))') || return 1
+            errors=$(SELECTION="$selection" python3 -c 'import json,os; print(len(json.loads(os.environ["SELECTION"])["errors"]))') || return 1
+            report="$ROOT/evidence/cleanup-$(clock_ms).jsonl"
+            if ! (set -o noclobber; printf '%s\n' "$selection" > "$report"); then
+              echo 'cleanup_evidence_loss=true' >&2;failed=1;report=''
+            fi
+            if test "$errors" -ne 0; then failed=1; fi
             for id in $ids; do
-              now=$(clock_ms) || return 1
-              (( now < CLEANUP_DEADLINE_MS )) || return 1
-              local inventory
-              inventory=$(dc ps -aq --no-trunc) || return 1
-              if ! printf '%s\n' "$inventory" | grep -Fx "$id" >/dev/null; then continue; fi
-              owner=$(dc inspect -f '{{index .Config.Labels "synthetic.cycle"}}' "$id") || return 1
-              candidate=$(dc inspect -f '{{index .Config.Labels "synthetic.commit"}}' "$id") || return 1
-              test "$owner" = "$OWNED_PREFIX" && test "$candidate" = "$GITHUB_SHA" || return 1
-              dc rm -f "$id" >/dev/null || failed=1
+              if ! inventory=$(dc ps -aq --no-trunc); then
+                cleanup_event "$report" "$id" inventory_error || failed=1
+                failed=1;continue
+              fi
+              if ! printf '%s\n' "$inventory" | grep -Fx "$id" >/dev/null; then
+                cleanup_event "$report" "$id" already_absent || failed=1
+                continue
+              fi
+              if ! owner=$(dc inspect -f '{{index .Config.Labels "synthetic.cycle"}}' "$id") ||
+                 ! candidate=$(dc inspect -f '{{index .Config.Labels "synthetic.commit"}}' "$id"); then
+                cleanup_event "$report" "$id" inspect_error || failed=1
+                failed=1;continue
+              fi
+              if test "$owner" != "$OWNED_PREFIX" || test "$candidate" != "$GITHUB_SHA"; then
+                cleanup_event "$report" "$id" ownership_mismatch || failed=1
+                failed=1;continue
+              fi
+              if dc rm -f "$id" >/dev/null; then
+                cleanup_event "$report" "$id" removal_ack_not_residue_proof || failed=1
+              else
+                cleanup_event "$report" "$id" removal_error || failed=1
+                failed=1
+              fi
             done
-            now=$(clock_ms) || return 1
-            (( now-started <= MAX_CLEANUP_SECONDS*1000 )) || return 1
             return "$failed"
           }
           SH
-
-      - name: Generate public synthetic fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib, hashlib
-          root=pathlib.Path(os.environ["ROOT"])
-          fixtures=[
-            {"case":"case-01","subject":"synthetic-a","value":"alpha"},
-            {"case":"case-02","subject":"synthetic-b","value":"beta"},
-            {"case":"case-03","subject":"synthetic-c","value":"gamma"},
-            {"case":"case-04","subject":"synthetic-d","value":"delta"},
-            {"case":"case-05","subject":"synthetic-e","value":"epsilon"},
-            {"case":"case-06","subject":"synthetic-f","value":"zeta"},
-            {"case":"case-07","subject":"synthetic-g","value":"eta"},
-            {"case":"case-08","subject":"synthetic-h","value":"theta"}
-          ]
-          data=json.dumps(fixtures,separators=(",",":"),ensure_ascii=True).encode()
-          if len(data)>int(os.environ['MAX_FIXTURE_BYTES']): raise SystemExit('fixture limit')
-          for case in fixtures:
-            if len(json.dumps(case,separators=(",",":")).encode())>int(os.environ['MAX_CASE_BYTES']):
-              raise SystemExit('case limit')
-          if len(data)>int(os.environ['MAX_CYCLE_BYTES']): raise SystemExit('cycle input limit')
-          out=root/'fixtures'/'fixtures.json'
-          with out.open('xb') as f: f.write(data)
-          (root/'evidence'/'fixture.sha256').write_text(hashlib.sha256(data).hexdigest()+'  ../fixtures/fixtures.json\n',encoding='utf-8')
-          PY
-          (cd "$ROOT/evidence" && sha256sum -c fixture.sha256 >/dev/null)
 
       - name: Static host inventory before
         shell: bash
@@ -217,13 +294,18 @@ jobs:
           set -euo pipefail
           source "$ROOT/state/control.sh"
           check_root
+          require_work_phase
           [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/synthetic/controls.py"
           FETCH_SECONDS=$(DC_SECONDS=15 deadline_seconds)
-          curl --proto '=https' --tlsv1.2 --connect-timeout 5 --max-time "$FETCH_SECONDS" \
-            --max-filesize 1048576 --fail --silent --show-error \
-            --output "$ROOT/state/model.py.tmp" "$URL"
+          HTTP_STATUS=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+            -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+            curl -q --proxy '' --noproxy '*' --proto '=https' --proto-redir '=https' \
+            --max-redirs 0 --tlsv1.2 --connect-timeout 5 --max-time "$FETCH_SECONDS" \
+            --max-filesize 1048576 --fail --silent --show-error --write-out '%{http_code}' \
+            --output "$ROOT/state/model.py.tmp" "$URL")
+          test "$HTTP_STATUS" = 200
           printf '%s  %s\n' "$MODEL_SOURCE_SHA256" "$ROOT/state/model.py.tmp" | sha256sum -c - >/dev/null
           mv "$ROOT/state/model.py.tmp" "$ROOT/state/model.py"
           chmod 400 "$ROOT/state/model.py"
@@ -259,7 +341,9 @@ jobs:
 
           run_worker() {
             local name="$1"
-            local id
+            local id intent
+            require_work_phase || return 1
+            intent=$(create_intent "$name") || return 1
             id=$(dc create \
               --name "$name" \
               --label "synthetic.cycle=$OWNED_PREFIX" \
@@ -277,7 +361,7 @@ jobs:
               --user 65534:65534 \
               "$IMAGE" sleep "$MAX_WORKER_SECONDS") || return 1
             [[ "$id" =~ ^[0-9a-f]{64}$ ]] || return 1
-            record_owned "$id" "$name" || return 1
+            record_owned "$id" "$name" "$intent" || return 1
             dc start "$id" >/dev/null || return 1
             printf '%s\n' "$id"
           }
@@ -362,8 +446,13 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${ROOT:-}" && test -d "$ROOT/evidence"
-          python3 - <<'PY'
-          import hashlib,os,pathlib,time
+          source "$ROOT/state/control.sh"
+          check_root
+          enter_cleanup
+          deadline_seconds >/dev/null
+          SEAL_SECONDS=$(DC_SECONDS=120 deadline_seconds)
+          timeout --signal=TERM --kill-after=1s "${SEAL_SECONDS}s" python3 - <<'PY'
+          import hashlib,os,pathlib,time,json
           root=pathlib.Path(os.environ['ROOT']); evidence=root/'evidence'
           files=sorted(p for p in evidence.iterdir() if p.name!='SHA256SUMS')
           if not files or any(p.is_symlink() or not p.is_file() for p in files):
@@ -379,7 +468,9 @@ jobs:
           elapsed=time.monotonic()-float((root/'state'/'cycle-start').read_text())
           if elapsed>int(os.environ['MAX_CYCLE_SECONDS']): raise SystemExit('cycle deadline exceeded')
           PY
-          (cd "$ROOT/evidence" && sha256sum -c SHA256SUMS >/dev/null)
+          VERIFY_SECONDS=$(DC_SECONDS=120 deadline_seconds)
+          (cd "$ROOT/evidence" && timeout --signal=TERM --kill-after=1s "${VERIFY_SECONDS}s" sha256sum -c SHA256SUMS >/dev/null)
+          deadline_seconds >/dev/null
           echo 'evidence=local_ephemeral_only'
 
       - name: Final safety statement
