@@ -26,7 +26,7 @@ jobs:
           trap cleanup EXIT
 
           echo "=== Public test image ==="
-          docker pull alpine:3.20
+          docker pull alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
           echo "=== Create isolated worker ==="
           docker run -d \
@@ -39,7 +39,7 @@ jobs:
             --tmpfs /tmp:rw,nosuid,noexec,size=256m \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            alpine:3.20 sleep 60
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc sleep 60
 
           echo "=== Verify isolation configuration ==="
           NETWORK=$(docker inspect -f \
