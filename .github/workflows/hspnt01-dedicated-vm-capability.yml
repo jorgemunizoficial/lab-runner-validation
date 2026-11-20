@@ -1,0 +1,44 @@
+name: HSPNT01 VM Capability - Read Only Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hspnt01-vm-capability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  capability:
+    # PREPARATION ONLY. Dispatch separately requires PO approval and public synthetic pre-dispatch gate.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read-only VM capability inventory (NO VM creation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "HSPNT01 READ-ONLY CAPABILITY PROBE. NO VM WILL BE CREATED."
+          echo "RUN_ID=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf "OS: "; uname -s
+          printf "ARCH: "; uname -m
+          printf "CPU_VISIBLE: "; nproc
+          awk '/MemTotal:/ {printf "MEMTOTAL_KIB: %s\n", $2}' /proc/meminfo
+          df -Pk / | awk 'NR==2 {printf "DISK_AVAILABLE_KIB: %s\n", $4}'
+          printf "CGROUP_V2: "
+          if [ -r /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "present; controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          else echo "NOT_PROVEN"; fi
+          printf "KVM_DEVICE: "
+          if [ -e /dev/kvm ]; then echo "present; access NOT_PROVEN"; else echo "absent"; fi
+          printf "VIRTUALIZATION: "
+          if command -v systemd-detect-virt >/dev/null; then systemd-detect-virt || true; else echo "unknown"; fi
+          for tool in virsh qemu-system-x86_64 virt-install; do
+            if command -v "$tool" >/dev/null; then
+              echo "$tool: present (version and permissions unverified)"
+            else echo "$tool: absent"; fi
+          done
+          echo "RESULT: READ_ONLY_INVENTORY_COMPLETE. VM_NOT_CREATED. NESTED_KVM_NOT_PROVEN."
+          echo "No images downloaded, no network probed, no VM/container/worker started."
